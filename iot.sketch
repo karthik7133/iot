@@ -1,0 +1,159 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <DHT.h>
+#include <ArduinoJson.h>
+
+#define DHTPIN 4
+#define DHTTYPE DHT22
+#define LED_PIN 2   // LED = Motor
+
+DHT dht(DHTPIN, DHTTYPE);
+
+const char* ssid = "Wokwi-GUEST";
+const char* password = "";
+
+// server endpoint
+const char* server = "https://tired-pillows-wear.loca.lt/data";
+
+// Open-Meteo API (Guntur coords)
+String weatherURL = "https://api.open-meteo.com/v1/forecast?latitude=16.3&longitude=80.4&hourly=precipitation_probability";
+
+void setup() {
+  Serial.begin(115200);
+  dht.begin();
+  pinMode(LED_PIN, OUTPUT);
+
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println("\nConnected to WiFi");
+}
+
+float getPrecipitation() {
+  WiFiClientSecure client;
+  client.setInsecure(); // Skip certificate validation for testing
+  
+  HTTPClient http;
+  http.begin(client, weatherURL);
+  int httpCode = http.GET();
+
+  float precipitation = 0;
+
+  if (httpCode == 200) {
+    String payload = http.getString();
+    DynamicJsonDocument doc(2048);
+    DeserializationError error = deserializeJson(doc, payload);
+
+    if (!error) {
+      precipitation = doc["hourly"]["precipitation_probability"][0];
+    } else {
+      Serial.println("JSON Parse Error");
+    }
+  } else {
+    Serial.print("Weather API HTTP Error: ");
+    Serial.println(httpCode);
+  }
+  
+  http.end();
+  return precipitation;
+}
+
+void loop() {
+  float humidity = dht.readHumidity();
+  float temp = dht.readTemperature();
+
+  if (isnan(humidity) || isnan(temp)) {
+    Serial.println("DHT error");
+    delay(2000);
+    return;
+  }
+
+  // simulate soil moisture %
+  int moisture = random(20, 90);
+
+  // get precipitation %
+  float precipitation = getPrecipitation();
+
+  // irrigation logic
+  bool motorON = false;
+
+  if (moisture < 40 && precipitation < 80) {
+    motorON = true;
+  }
+
+  if (moisture > 70 || precipitation > 80) {
+    motorON = false;
+  }
+
+  digitalWrite(LED_PIN, motorON ? HIGH : LOW);
+
+  String motorStatus = motorON ? "ON" : "OFF";
+
+  // water saving logic
+  float savedWater = 0;
+  if (!motorON && precipitation > 80) {
+    savedWater = 1; // rain prevented watering
+  }
+
+  Serial.println("--------------------");
+  Serial.println("Temp: " + String(temp, 1) + "°C");
+  Serial.println("Humidity: " + String(humidity, 1) + "%");
+  Serial.println("Moisture: " + String(moisture) + "%");
+  Serial.println("Precipitation: " + String(precipitation) + "%");
+  Serial.println("Motor: " + motorStatus);
+
+  // send to server
+  if (WiFi.status() == WL_CONNECTED) {
+    WiFiClientSecure client;
+    client.setInsecure();
+    HTTPClient http;
+    http.begin(client, server);
+    http.setTimeout(30000); // 30s timeout for Wokwi lag
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("bypass-tunnel-reminder", "true");
+    http.addHeader("X-Tunnel-Skip-Bypass", "true");
+    http.addHeader("bypass-localtunnel", "true");
+
+    String json = "{";
+    json += "\"temperature\":" + String(temp) + ",";
+    json += "\"humidity\":" + String(humidity) + ",";
+    json += "\"moisture\":" + String(moisture) + ",";
+    json += "\"precipitation\":" + String(precipitation) + ",";
+    json += "\"motorStatus\":\"" + motorStatus + "\",";
+    json += "\"savedWater\":" + String(savedWater);
+    json += "}";
+
+    Serial.print("Attempting to POST to: ");
+    Serial.println(server);
+    Serial.print("Local IP: ");
+    Serial.println(WiFi.localIP());
+    Serial.print("Signal Strength (RSSI): ");
+    Serial.println(WiFi.RSSI());
+    
+    int httpResponseCode = http.POST(json);
+    
+    if (httpResponseCode > 0) {
+      Serial.println("Server Response: " + String(httpResponseCode));
+      String response = http.getString();
+      Serial.println("Payload: " + response);
+    } else {
+      Serial.print("Error sending to server: ");
+      Serial.println(httpResponseCode);
+      Serial.print("HTTP Client Error string: ");
+      Serial.println(http.errorToString(httpResponseCode).c_str());
+      
+      // Check if WiFi is still connected
+      if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("WiFi disconnected during request!");
+      }
+    }
+    
+    http.end();
+  }
+
+  delay(15000); // 15 sec
+}
