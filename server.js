@@ -9,6 +9,7 @@ app.use(cors());
 // Global Logger
 app.use((req, res, next) => {
     console.log(`[${new Date().toLocaleTimeString()}] ${req.method} ${req.url}`);
+    if (req.method === 'POST') console.log("Payload:", JSON.stringify(req.body));
     next();
 });
 
@@ -16,7 +17,10 @@ app.use((req, res, next) => {
 app.get("/", (req, res) => res.send("Server is ALIVE"));
 app.get("/ping", (req, res) => res.send("pong"));
 
-mongoose.connect("mongodb+srv://karthik7133:Ch.karthik.7@cluster7133.yzxk6k4.mongodb.net/irrigation");
+const MONGODB_URI = "mongodb+srv://karthik7133:Ch.karthik.7@cluster7133.yzxk6k4.mongodb.net/irrigation";
+mongoose.connect(MONGODB_URI)
+    .then(() => console.log("Connected to MongoDB Atlas"))
+    .catch(err => console.error("MongoDB Connection Error:", err));
 
 // Schema for Sensor Data
 const DataSchema = new mongoose.Schema({
@@ -26,10 +30,10 @@ const DataSchema = new mongoose.Schema({
     precipitation: Number,
     motorStatus: String,
     savedWater: Number,
-    batteryLevel: Number,           // Added
+    batteryLevel: Number,
     diseaseRisk: String,            // Added ("LOW" or "HIGH")
     time: { type: Date, default: Date.now }
-});
+}, { collection: 'data' });
 
 const Data = mongoose.model("Data", DataSchema);
 
@@ -42,7 +46,7 @@ const SettingsSchema = new mongoose.Schema({
     minMoisture: Number,
     maxMoisture: Number,
     lastUpdated: { type: Date, default: Date.now }
-});
+}, { collection: 'settings' });
 
 const Settings = mongoose.model("Settings", SettingsSchema);
 
@@ -102,26 +106,25 @@ app.get("/settings", async (req, res) => {
 
 // POST data from ESP32
 app.post("/data", async (req, res) => {
-    console.log("Data received from ESP32:", req.body);
-
-    const { temperature, humidity } = req.body;
-
-    // Disease Risk Calculation
-    // if temperature > 25 and humidity > 80, risk is "HIGH", else "LOW"
-    let diseaseRisk = "LOW";
-    if (temperature > 25 && humidity > 80) {
-        diseaseRisk = "HIGH";
-    }
-
-    const data = new Data({
-        ...req.body,
-        diseaseRisk
-    });
-
     try {
-        await data.save();
-        res.send("Saved");
+        console.log("Saving data:", req.body);
+        const { temperature, humidity } = req.body;
+
+        let diseaseRisk = "LOW";
+        if (temperature && humidity && temperature > 25 && humidity > 80) {
+            diseaseRisk = "HIGH";
+        }
+
+        const data = new Data({
+            ...req.body,
+            diseaseRisk
+        });
+
+        const savedData = await data.save();
+        console.log("Data saved successfully:", savedData._id);
+        res.status(201).send("Saved");
     } catch (err) {
+        console.error("Error saving data:", err.message);
         res.status(500).send(err.message);
     }
 });
@@ -129,6 +132,7 @@ app.post("/data", async (req, res) => {
 // Latest data
 app.get("/latest", async (req, res) => {
     const latest = await Data.findOne().sort({ time: -1 });
+    if (!latest) return res.json({});
     res.json(latest);
 });
 
@@ -152,4 +156,7 @@ app.get("/stats", async (req, res) => {
     res.json({ waterSavedPercent: saved.toFixed(2) });
 });
 
-app.listen(3000, () => console.log("Server running on port 3000"));
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, "0.0.0.0", () => {
+    console.log(`Server running on port ${PORT}`);
+});

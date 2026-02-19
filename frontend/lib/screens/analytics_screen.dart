@@ -50,50 +50,70 @@ class AnalyticsScreen extends StatelessWidget {
                 
                 _buildHeader("Moisture & Weather Trends"),
                 const SizedBox(height: 15),
-                SizedBox(
-                  height: 280,
-                  child: GlassCard(
-                    padding: const EdgeInsets.all(15),
-                    child: Consumer<IrrigationProvider>(
-                      builder: (context, provider, child) {
-                        return LineChart(
-                          _buildDualLineData(
-                            provider.history, 
-                            (d) => d.moisture.toDouble(), 
-                            (d) => d.precipitation,
-                            const Color(0xFF00E5FF),
-                            Colors.white38,
-                            "Moisture",
-                            "Rain"
+                GlassCard(
+                  padding: const EdgeInsets.all(15),
+                  child: Consumer<IrrigationProvider>(
+                    builder: (context, provider, child) {
+                      return Column(
+                        children: [
+                          SizedBox(
+                            height: 250,
+                            child: LineChart(
+                              _buildDualLineData(
+                                provider.history, 
+                                (d) => d.moisture.toDouble(), 
+                                (d) => d.precipitation,
+                                const Color(0xFF00E5FF),
+                                Colors.white.withOpacity(0.5),
+                                "Moisture",
+                                "Rain"
+                              ),
+                            ),
                           ),
-                        );
-                      },
-                    ),
+                          const SizedBox(height: 20),
+                          const Divider(color: Colors.white10),
+                          const SizedBox(height: 15),
+                          _buildStatsSection(provider.history, (d) => d.moisture.toDouble(), "Moisture", "%", const Color(0xFF00E5FF)),
+                          const SizedBox(height: 15),
+                          _buildStatsSection(provider.history, (d) => d.precipitation, "Precipitation", "mm", Colors.white.withOpacity(0.7)),
+                        ],
+                      );
+                    },
                   ),
                 ),
                 
                 const SizedBox(height: 40),
                 _buildHeader("Temp vs Humidity"),
                 const SizedBox(height: 15),
-                SizedBox(
-                  height: 280,
-                  child: GlassCard(
-                    padding: const EdgeInsets.all(15),
-                    child: Consumer<IrrigationProvider>(
-                      builder: (context, provider, child) {
-                        return LineChart(
-                          _buildDualLineData(
-                            provider.history, 
-                            (d) => d.temperature, 
-                            (d) => d.humidity,
-                            const Color(0xFFFF9100),
-                            const Color(0xFF2196F3),
-                            "Temp",
-                            "Humid"
+                GlassCard(
+                  padding: const EdgeInsets.all(15),
+                  child: Consumer<IrrigationProvider>(
+                    builder: (context, provider, child) {
+                      return Column(
+                        children: [
+                          SizedBox(
+                            height: 250,
+                            child: LineChart(
+                              _buildDualLineData(
+                                provider.history, 
+                                (d) => d.temperature, 
+                                (d) => d.humidity,
+                                const Color(0xFFFF9100),
+                                const Color(0xFF2196F3),
+                                "Temp",
+                                "Humid"
+                              ),
+                            ),
                           ),
-                        );
-                      },
-                    ),
+                          const SizedBox(height: 20),
+                          const Divider(color: Colors.white10),
+                          const SizedBox(height: 15),
+                          _buildStatsSection(provider.history, (d) => d.temperature, "Temperature", "°C", const Color(0xFFFF9100)),
+                          const SizedBox(height: 15),
+                          _buildStatsSection(provider.history, (d) => d.humidity, "Humidity", "%", const Color(0xFF2196F3)),
+                        ],
+                      );
+                    },
                   ),
                 ),
                 const SizedBox(height: 40),
@@ -112,6 +132,43 @@ class AnalyticsScreen extends StatelessWidget {
         const SizedBox(width: 10),
         Text(title, style: GoogleFonts.outfit(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold)),
       ],
+    );
+  }
+
+  Widget _buildStatsSection(List<dynamic> history, double Function(dynamic) selector, String label, String unit, Color color) {
+    if (history.isEmpty) return const SizedBox.shrink();
+
+    double min = history.map(selector).reduce((a, b) => a < b ? a : b);
+    double max = history.map(selector).reduce((a, b) => a > b ? a : b);
+    double avg = history.map(selector).reduce((a, b) => a + b) / history.length;
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(label, style: GoogleFonts.outfit(color: color, fontSize: 14, fontWeight: FontWeight.bold)),
+        const SizedBox(height: 10),
+        Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            _buildStatItem("Lowest", "${min.toStringAsFixed(1)}$unit", Icons.arrow_downward, Colors.redAccent),
+            _buildStatItem("Highest", "${max.toStringAsFixed(1)}$unit", Icons.arrow_upward, Colors.greenAccent),
+            _buildStatItem("Average", "${avg.toStringAsFixed(1)}$unit", Icons.analytics, Colors.amberAccent),
+          ],
+        ),
+      ],
+    );
+  }
+
+  Widget _buildStatItem(String label, String value, IconData icon, Color iconColor) {
+    return Expanded(
+      child: Column(
+        children: [
+          Icon(icon, color: iconColor, size: 16),
+          const SizedBox(height: 4),
+          Text(value, style: GoogleFonts.outfit(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)),
+          Text(label, style: GoogleFonts.outfit(color: Colors.white54, fontSize: 10)),
+        ],
+      ),
     );
   }
 
@@ -139,19 +196,26 @@ class AnalyticsScreen extends StatelessWidget {
 
     return LineChartData(
       lineTouchData: LineTouchData(
+        handleBuiltInTouches: true,
         touchTooltipData: LineTouchTooltipData(
-          getTooltipColor: (touchedSpot) => const Color(0xFF203A43).withOpacity(0.8),
+          getTooltipColor: (touchedSpot) => const Color(0xFF203A43).withOpacity(0.9),
+          tooltipBorderRadius: const BorderRadius.all(Radius.circular(8)),
           getTooltipItems: (touchedSpots) {
             return touchedSpots.map((spot) {
               return LineTooltipItem(
                 "${spot.barIndex == 0 ? label1 : label2}: ${spot.y.toStringAsFixed(1)}",
-                GoogleFonts.outfit(color: Colors.white, fontWeight: FontWeight.bold),
+                GoogleFonts.outfit(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 12),
               );
             }).toList();
           },
         ),
       ),
-      gridData: const FlGridData(show: false),
+      gridData: FlGridData(
+        show: true,
+        drawVerticalLine: false,
+        horizontalInterval: 20,
+        getDrawingHorizontalLine: (value) => const FlLine(color: Colors.white10, strokeWidth: 1),
+      ),
       titlesData: const FlTitlesData(
         rightTitles: AxisTitles(sideTitles: SideTitles(showTitles: false)),
         topTitles: AxisTitles(sideTitles: SideTitles(showTitles: false)),
@@ -170,6 +234,7 @@ class AnalyticsScreen extends StatelessWidget {
     return LineChartBarData(
       spots: spots,
       isCurved: true,
+      curveSmoothness: 0.15,
       color: color,
       barWidth: 3,
       isStrokeCapRound: true,
@@ -179,7 +244,7 @@ class AnalyticsScreen extends StatelessWidget {
         gradient: LinearGradient(
           begin: Alignment.topCenter,
           end: Alignment.bottomCenter,
-          colors: [color.withOpacity(0.2), Colors.transparent],
+          colors: [color.withOpacity(0.3), Colors.transparent],
         ),
       ),
     );
