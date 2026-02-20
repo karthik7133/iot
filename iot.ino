@@ -145,6 +145,10 @@ void loop() {
     HTTPClient http;
     http.begin(client, dataEndpoint);
     http.addHeader("Content-Type", "application/json");
+    
+    // Bypass headers for tunnel services if used
+    http.addHeader("bypass-tunnel-reminder", "true");
+    http.addHeader("X-Tunnel-Skip-Bypass", "true");
 
     String json = "{";
     json += "\"temperature\":" + String(temp) + ",";
@@ -156,7 +160,19 @@ void loop() {
     json += "\"savedWater\":" + String(savedWater);
     json += "}";
 
+    Serial.print("Uploading to DB... ");
     int httpResponseCode = http.POST(json);
+    
+    if (httpResponseCode > 0) {
+      String response = http.getString();
+      Serial.println("Success! Status: " + String(httpResponseCode));
+      Serial.println("Server Response: " + response);
+    } else {
+      Serial.print("FAILED. Error code: ");
+      Serial.println(httpResponseCode);
+      Serial.println(http.errorToString(httpResponseCode).c_str());
+    }
+    
     http.end();
   }
 
