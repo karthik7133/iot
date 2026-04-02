@@ -1,180 +1,167 @@
-#include <WiFi.h>
-#include <HTTPClient.h>
-#include <WiFiClientSecure.h>
-#include <DHT.h>
-#include <ArduinoJson.h>
+import network
+import urequests as requests
+import dht
+from machine import Pin
+import ujson as json
+import time
+import random
 
-#define DHTPIN 4
-#define DHTTYPE DHT22
-#define LED_PIN 2   // LED = Motor
+# --- Pin Setup ---
+DHT_PIN = 4
+LED_PIN = 2  # LED = Motor
 
-DHT dht(DHTPIN, DHTTYPE);
+sensor = dht.DHT22(Pin(DHT_PIN))
+motor = Pin(LED_PIN, Pin.OUT)
 
-const char* ssid = "Wokwi-GUEST";
-const char* password = "";
+# --- Network & Endpoints ---
+ssid = "EliteNet-Nirvana_101"
+password = "9790815877"
 
-// server endpoints
-const char* dataEndpoint = "https://iot-0ts3.onrender.com/data";
-const char* settingsEndpoint = "https://iot-0ts3.onrender.com/settings";
+data_endpoint = "https://iot-0ts3.onrender.com/data"
+settings_endpoint = "https://iot-0ts3.onrender.com/settings"
 
-// Dynamic Config Variables (Defaults)
-float lat = 16.3;
-float lng = 80.4;
-int minMoisture = 40;
-int maxMoisture = 70;
-float batteryLevel = 100.0; // Simulated battery
+# --- Dynamic Config Variables (Defaults) ---
+lat = 16.3
+lng = 80.4
+min_moisture = 40
+max_moisture = 70
+battery_level = 100.0
 
-void setup() {
-  Serial.begin(115200);
-  dht.begin();
-  pinMode(LED_PIN, OUTPUT);
+def connect_wifi():
+    wlan = network.WLAN(network.STA_IF)
+    wlan.active(True)
+    if not wlan.isconnected():
+        print('Connecting to WiFi...')
+        wlan.connect(ssid, password)
+        while not wlan.isconnected():
+            time.sleep(0.5)
+            print(".", end="")
+    print('\nConnected to WiFi')
+    print('Network config:', wlan.ifconfig())
 
-  WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
+def fetch_settings():
+    global lat, lng, min_moisture, max_moisture
+    try:
+        response = requests.get(settings_endpoint)
+        if response.status_code == 200:
+            data = response.json()
+            lat = data.get("latitude", lat)
+            lng = data.get("longitude", lng)
+            min_moisture = data.get("minMoisture", min_moisture)
+            max_moisture = data.get("maxMoisture", max_moisture)
+            print(f"Settings Updated: {lat}, {lng}, Min: {min_moisture}")
+        response.close()
+    except Exception as e:
+        print("Failed to fetch settings:", e)
 
-  Serial.println("\nConnected to WiFi");
-  
-  // Initial settings fetch
-  fetchSettings();
-}
+def get_weather_data():
+    # Ask for precipitation, temp, and humidity all in one URL
+    weather_url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lng}&hourly=precipitation_probability&current=temperature_2m,relative_humidity_2m"
+    try:
+        response = requests.get(weather_url)
+        if response.status_code == 200:
+            data = response.json()
+            
+            # Extract all three values
+            precip = data["hourly"]["precipitation_probability"][0]
+            api_temp = data["current"]["temperature_2m"]
+            api_humidity = data["current"]["relative_humidity_2m"]
+            
+            response.close()
+            # Return all three as a tuple
+            return precip, api_temp, api_humidity
+            
+        response.close()
+    except Exception as e:
+        print("Failed to fetch weather:", e)
+        
+    # If the API fails, return safe defaults (0% precip, 25C temp, 50% humidity)
+    return 0, 25.0, 50.0
 
-void fetchSettings() {
-  if (WiFi.status() == WL_CONNECTED) {
-    WiFiClientSecure client;
-    client.setInsecure();
-    HTTPClient http;
-    http.begin(client, settingsEndpoint);
-    int httpCode = http.GET();
+def main():
+    global battery_level
+    connect_wifi()
+    fetch_settings()
 
-    if (httpCode == 200) {
-      String payload = http.getString();
-      StaticJsonDocument<512> doc;
-      DeserializationError error = deserializeJson(doc, payload);
+    counter = 0
 
-      if (!error) {
-        lat = doc["latitude"] | lat;
-        lng = doc["longitude"] | lng;
-        minMoisture = doc["minMoisture"] | minMoisture;
-        maxMoisture = doc["maxMoisture"] | maxMoisture;
-        Serial.println("Settings Updated: " + String(lat) + ", " + String(lng) + ", Min: " + String(minMoisture));
-      }
-    }
-    http.end();
-  }
-}
+    while True:
+        # Fetch settings every 10 loops
+        if counter % 10 == 0 and counter != 0:
+            fetch_settings()
+        counter += 1
 
-float getPrecipitation() {
-  WiFiClientSecure client;
-  client.setInsecure();
-  
-  // Construct dynamic weather URL
-  String weatherURL = "https://api.open-meteo.com/v1/forecast?latitude=" + String(lat) + "&longitude=" + String(lng) + "&hourly=precipitation_probability";
-  
-  HTTPClient http;
-  http.begin(client, weatherURL);
-  int httpCode = http.GET();
+        # 1. Fetch the API data FIRST
+        precipitation, api_temp, api_humidity = get_weather_data()
 
-  float precipitation = 0;
+        # 2. THEN Read DHT Sensor
+        try:
+            sensor.measure()
+            temp = sensor.temperature()
+            humidity = sensor.humidity()
+            print("Using physical DHT sensor data.")
+        except OSError as e:
+            print("DHT error. Using API fallback data...")
+            # Now this works perfectly because api_temp and api_humidity already exist!
+            temp = api_temp
+            humidity = api_humidity
 
-  if (httpCode == 200) {
-    String payload = http.getString();
-    DynamicJsonDocument doc(2048);
-    DeserializationError error = deserializeJson(doc, payload);
+        # Simulate soil moisture %
+        moisture = random.randint(20, 90)
 
-    if (!error) {
-      precipitation = doc["hourly"]["precipitation_probability"][0];
-    }
-  }
-  
-  http.end();
-  return precipitation;
-}
+        # Irrigation logic (Dynamic)
+        motor_on = False
+        if moisture < min_moisture and precipitation < 80:
+            motor_on = True
+        if moisture > max_moisture or precipitation > 80:
+            motor_on = False
 
-void loop() {
-  // Periodically fetch settings every few minutes (optional, here we do it every loop for simplicity in demo)
-  // or use a counter to fetch every 10 loops.
-  static int counter = 0;
-  if (counter % 10 == 0) {
-    fetchSettings();
-  }
-  counter++;
+        motor.value(1 if motor_on else 0)
+        motor_status = "ON" if motor_on else "OFF"
 
-  float humidity = dht.readHumidity();
-  float temp = dht.readTemperature();
+        # Battery simulation
+        battery_level -= 0.5
+        if battery_level < 20:
+            battery_level = 100
 
-  if (isnan(humidity) || isnan(temp)) {
-    Serial.println("DHT error");
-    delay(2000);
-    return;
-  }
+        # Water saving logic
+        saved_water = 1 if not motor_on and precipitation > 80 else 0
 
-  // simulate soil moisture %
-  int moisture = random(20, 90);
+        print("\n--- Sensor Update ---")
+        print(f"Temp: {temp:.1f}C, Humidity: {humidity:.1f}%")
+        print(f"Moisture: {moisture}%, Precp: {precipitation}%")
+        print(f"Motor: {motor_status}, Battery: {battery_level}%")
 
-  // get precipitation %
-  float precipitation = getPrecipitation();
+        # Send to server
+        headers = {
+            "Content-Type": "application/json",
+            "bypass-tunnel-reminder": "true",
+            "X-Tunnel-Skip-Bypass": "true"
+        }
 
-  // irrigation logic (Dynamic)
-  bool motorON = false;
-  if (moisture < minMoisture && precipitation < 80) motorON = true;
-  if (moisture > maxMoisture || precipitation > 80) motorON = false;
+        # MicroPython dictionaries convert perfectly to JSON
+        payload = {
+            "temperature": temp,
+            "humidity": humidity,
+            "moisture": moisture,
+            "precipitation": precipitation,
+            "motorStatus": motor_status,
+            "batteryLevel": battery_level,
+            "savedWater": saved_water
+        }
 
-  digitalWrite(LED_PIN, motorON ? HIGH : LOW);
-  String motorStatus = motorON ? "ON" : "OFF";
+        try:
+            print("Uploading to DB... ", end="")
+            response = requests.post(data_endpoint, json=payload, headers=headers)
+            print(f"Success! Status: {response.status_code}")
+            print("Server Response:", response.text)
+            response.close()
+        except Exception as e:
+            print("FAILED. Error:", e)
 
-  // battery simulation (drop from 100 to 20 slowly)
-  batteryLevel -= 0.5;
-  if (batteryLevel < 20) batteryLevel = 100;
+        time.sleep(15)  # Wait 15 seconds
 
-  // water saving logic
-  float savedWater = 0;
-  if (!motorON && precipitation > 80) savedWater = 1;
+if __name__ == "__main__":
+    main()
 
-  Serial.println("--- Sensor Update ---");
-  Serial.println("Temp: " + String(temp, 1) + "C, Humidity: " + String(humidity, 1) + "%");
-  Serial.println("Moisture: " + String(moisture) + "%, Precp: " + String(precipitation) + "%");
-  Serial.println("Motor: " + motorStatus + ", Battery: " + String(batteryLevel) + "%");
-
-  // send to server
-  if (WiFi.status() == WL_CONNECTED) {
-    WiFiClientSecure client;
-    client.setInsecure();
-    HTTPClient http;
-    http.begin(client, dataEndpoint);
-    http.addHeader("Content-Type", "application/json");
-    
-    // Bypass headers for tunnel services if used
-    http.addHeader("bypass-tunnel-reminder", "true");
-    http.addHeader("X-Tunnel-Skip-Bypass", "true");
-
-    String json = "{";
-    json += "\"temperature\":" + String(temp) + ",";
-    json += "\"humidity\":" + String(humidity) + ",";
-    json += "\"moisture\":" + String(moisture) + ",";
-    json += "\"precipitation\":" + String(precipitation) + ",";
-    json += "\"motorStatus\":\"" + motorStatus + "\",";
-    json += "\"batteryLevel\":" + String(batteryLevel) + ",";
-    json += "\"savedWater\":" + String(savedWater);
-    json += "}";
-
-    Serial.print("Uploading to DB... ");
-    int httpResponseCode = http.POST(json);
-    
-    if (httpResponseCode > 0) {
-      String response = http.getString();
-      Serial.println("Success! Status: " + String(httpResponseCode));
-      Serial.println("Server Response: " + response);
-    } else {
-      Serial.print("FAILED. Error code: ");
-      Serial.println(httpResponseCode);
-      Serial.println(http.errorToString(httpResponseCode).c_str());
-    }
-    
-    http.end();
-  }
-
-  delay(15000); // 15 sec
-}
+if everything is fine we will connect to wifi and start running the server and esp32 device okay?
