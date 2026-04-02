@@ -164,4 +164,3 @@ def main():
 if __name__ == "__main__":
     main()
 
-if everything is fine we will connect to wifi and start running the server and esp32 device okay?
