@@ -1,180 +1,249 @@
-#include <WiFi.h>
-#include <HTTPClient.h>
-#include <WiFiClientSecure.h>
-#include <DHT.h>
-#include <ArduinoJson.h>
+//board 1 code ................
+import network
+import time
+import ujson
+from machine import Pin, ADC, PWM
+from umqtt.simple import MQTTClient
 
-#define DHTPIN 4
-#define DHTTYPE DHT22
-#define LED_PIN 2   // LED = Motor
+# --- Wokwi Hardware Setup ---
+gate_servo = PWM(Pin(15), freq=50)
+s1 = ADC(Pin(32))
+s2 = ADC(Pin(33))
+s3 = ADC(Pin(34))
+s4 = ADC(Pin(35))
 
-DHT dht(DHTPIN, DHTTYPE);
+for s in [s1, s2, s3, s4]:
+    s.atten(ADC.ATTN_11DB)
 
-const char* ssid = "Wokwi-GUEST";
-const char* password = "";
+# --- Network & MQTT Settings ---
+WIFI_SSID = "Wokwi-GUEST"
+WIFI_PASS = ""
+MQTT_BROKER = "broker.hivemq.com" 
+CLIENT_ID = "esp32_zone1"
 
-// server endpoints
-const char* dataEndpoint = "https://iot-0ts3.onrender.com/data";
-const char* settingsEndpoint = "https://iot-0ts3.onrender.com/settings";
+TOPIC_PROGRESS = b"smartfarm/zone1/progress"  # To Server/App
+TOPIC_CONTROL = b"smartfarm/control"          # From Server (Weather)
+TOPIC_SEQUENCE = b"smartfarm/sequence"        # To Board 2
 
-// Dynamic Config Variables (Defaults)
-float lat = 16.3;
-float lng = 80.4;
-int minMoisture = 40;
-int maxMoisture = 70;
-float batteryLevel = 100.0; // Simulated battery
+# Global State
+system_enabled = True # Controlled by the server's weather check
+zone_completed = False
 
-void setup() {
-  Serial.begin(115200);
-  dht.begin();
-  pinMode(LED_PIN, OUTPUT);
+def connect_wifi():
+    wlan = network.WLAN(network.STA_IF)
+    wlan.active(True)
+    wlan.connect(WIFI_SSID, WIFI_PASS)
+    print("Connecting to WiFi...", end="")
+    while not wlan.isconnected():
+        time.sleep(0.5)
+    print("\nConnected to WiFi!")
 
-  WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
+def open_gate():
+    print("Opening Gate 1...")
+    gate_servo.duty(115) 
 
-  Serial.println("\nConnected to WiFi");
-  
-  // Initial settings fetch
-  fetchSettings();
-}
+def close_gate():
+    print("Closing Gate 1...")
+    gate_servo.duty(40)  
 
-void fetchSettings() {
-  if (WiFi.status() == WL_CONNECTED) {
-    WiFiClientSecure client;
-    client.setInsecure();
-    HTTPClient http;
-    http.begin(client, settingsEndpoint);
-    int httpCode = http.GET();
+def map_sensor_to_percent(adc_val):
+    return int((adc_val / 4095.0) * 100)
 
-    if (httpCode == 200) {
-      String payload = http.getString();
-      StaticJsonDocument<512> doc;
-      DeserializationError error = deserializeJson(doc, payload);
+# --- Listen for Server Weather Overrides ---
+def mqtt_callback(topic, msg):
+    global system_enabled
+    if topic == TOPIC_CONTROL:
+        try:
+            # Server sends JSON: {"command": "CLOSE", "timestamp": ...}
+            data = ujson.loads(msg)
+            command = data.get("command", "")
+            if command == "CLOSE":
+                print("☁️ SERVER OVERRIDE: Rain Expected. Pausing Gate 1.")
+                system_enabled = False
+                close_gate()
+            elif command == "OPEN":
+                print("☀️ SERVER OVERRIDE: Clear Weather. Resuming.")
+                system_enabled = True
+                if not zone_completed:
+                    open_gate()
+        except:
+            pass
 
-      if (!error) {
-        lat = doc["latitude"] | lat;
-        lng = doc["longitude"] | lng;
-        minMoisture = doc["minMoisture"] | minMoisture;
-        maxMoisture = doc["maxMoisture"] | maxMoisture;
-        Serial.println("Settings Updated: " + String(lat) + ", " + String(lng) + ", Min: " + String(minMoisture));
-      }
-    }
-    http.end();
-  }
-}
-
-float getPrecipitation() {
-  WiFiClientSecure client;
-  client.setInsecure();
-  
-  // Construct dynamic weather URL
-  String weatherURL = "https://api.open-meteo.com/v1/forecast?latitude=" + String(lat) + "&longitude=" + String(lng) + "&hourly=precipitation_probability";
-  
-  HTTPClient http;
-  http.begin(client, weatherURL);
-  int httpCode = http.GET();
-
-  float precipitation = 0;
-
-  if (httpCode == 200) {
-    String payload = http.getString();
-    DynamicJsonDocument doc(2048);
-    DeserializationError error = deserializeJson(doc, payload);
-
-    if (!error) {
-      precipitation = doc["hourly"]["precipitation_probability"][0];
-    }
-  }
-  
-  http.end();
-  return precipitation;
-}
-
-void loop() {
-  // Periodically fetch settings every few minutes (optional, here we do it every loop for simplicity in demo)
-  // or use a counter to fetch every 10 loops.
-  static int counter = 0;
-  if (counter % 10 == 0) {
-    fetchSettings();
-  }
-  counter++;
-
-  float humidity = dht.readHumidity();
-  float temp = dht.readTemperature();
-
-  if (isnan(humidity) || isnan(temp)) {
-    Serial.println("DHT error");
-    delay(2000);
-    return;
-  }
-
-  // simulate soil moisture %
-  int moisture = random(20, 90);
-
-  // get precipitation %
-  float precipitation = getPrecipitation();
-
-  // irrigation logic (Dynamic)
-  bool motorON = false;
-  if (moisture < minMoisture && precipitation < 80) motorON = true;
-  if (moisture > maxMoisture || precipitation > 80) motorON = false;
-
-  digitalWrite(LED_PIN, motorON ? HIGH : LOW);
-  String motorStatus = motorON ? "ON" : "OFF";
-
-  // battery simulation (drop from 100 to 20 slowly)
-  batteryLevel -= 0.5;
-  if (batteryLevel < 20) batteryLevel = 100;
-
-  // water saving logic
-  float savedWater = 0;
-  if (!motorON && precipitation > 80) savedWater = 1;
-
-  Serial.println("--- Sensor Update ---");
-  Serial.println("Temp: " + String(temp, 1) + "C, Humidity: " + String(humidity, 1) + "%");
-  Serial.println("Moisture: " + String(moisture) + "%, Precp: " + String(precipitation) + "%");
-  Serial.println("Motor: " + motorStatus + ", Battery: " + String(batteryLevel) + "%");
-
-  // send to server
-  if (WiFi.status() == WL_CONNECTED) {
-    WiFiClientSecure client;
-    client.setInsecure();
-    HTTPClient http;
-    http.begin(client, dataEndpoint);
-    http.addHeader("Content-Type", "application/json");
+def main():
+    global zone_completed
+    connect_wifi()
     
-    // Bypass headers for tunnel services if used
-    http.addHeader("bypass-tunnel-reminder", "true");
-    http.addHeader("X-Tunnel-Skip-Bypass", "true");
-
-    String json = "{";
-    json += "\"temperature\":" + String(temp) + ",";
-    json += "\"humidity\":" + String(humidity) + ",";
-    json += "\"moisture\":" + String(moisture) + ",";
-    json += "\"precipitation\":" + String(precipitation) + ",";
-    json += "\"motorStatus\":\"" + motorStatus + "\",";
-    json += "\"batteryLevel\":" + String(batteryLevel) + ",";
-    json += "\"savedWater\":" + String(savedWater);
-    json += "}";
-
-    Serial.print("Uploading to DB... ");
-    int httpResponseCode = http.POST(json);
+    client = MQTTClient(CLIENT_ID, MQTT_BROKER)
+    client.set_callback(mqtt_callback)
+    client.connect()
     
-    if (httpResponseCode > 0) {
-      String response = http.getString();
-      Serial.println("Success! Status: " + String(httpResponseCode));
-      Serial.println("Server Response: " + response);
-    } else {
-      Serial.print("FAILED. Error code: ");
-      Serial.println(httpResponseCode);
-      Serial.println(http.errorToString(httpResponseCode).c_str());
-    }
+    # Subscribe to server commands
+    client.subscribe(TOPIC_CONTROL)
+    print(f"Connected to MQTT. Subscribed to {TOPIC_CONTROL}")
     
-    http.end();
-  }
+    # Start irrigation if weather allows
+    if system_enabled:
+        open_gate()
 
-  delay(15000); // 15 sec
-}
+    while not zone_completed:
+        # Check for incoming server messages
+        client.check_msg()
+        
+        val1 = map_sensor_to_percent(s1.read())
+        val2 = map_sensor_to_percent(s2.read())
+        val3 = map_sensor_to_percent(s3.read())
+        val4 = map_sensor_to_percent(s4.read())
+        
+        overall_progress = (val1 + val2 + val3 + val4) // 4
+        
+        # Exact payload required by your new README
+        payload = ujson.dumps({
+            "zone": 1,
+            "progress": overall_progress
+        })
+        
+        client.publish(TOPIC_PROGRESS, payload)
+        print(f"Zone 1 Progress: {overall_progress}% -> Server")
+        
+        if overall_progress >= 95:
+            print("✅ Zone 1 Fully Watered!")
+            close_gate()
+            # Tell Board 2 to start!
+            client.publish(TOPIC_SEQUENCE, b"START_ZONE_2")
+            zone_completed = True
+            
+        time.sleep(2)
+
+if __name__ == "__main__":
+    main()
+
+
+// board 2 code...............
+import network
+import time
+import ujson
+from machine import Pin, ADC, PWM
+from umqtt.simple import MQTTClient
+
+# --- Wokwi Hardware Setup ---
+gate_servo = PWM(Pin(15), freq=50)
+s1 = ADC(Pin(32))
+s2 = ADC(Pin(33))
+s3 = ADC(Pin(34))
+s4 = ADC(Pin(35))
+
+for s in [s1, s2, s3, s4]:
+    s.atten(ADC.ATTN_11DB)
+
+# --- Network & MQTT Settings ---
+WIFI_SSID = "Wokwi-GUEST"
+WIFI_PASS = ""
+MQTT_BROKER = "broker.hivemq.com" 
+CLIENT_ID = "esp32_zone2"
+
+TOPIC_PROGRESS = b"smartfarm/zone2/progress"  # To Server/App
+TOPIC_CONTROL = b"smartfarm/control"          # From Server (Weather)
+TOPIC_SEQUENCE = b"smartfarm/sequence"        # From Board 1
+
+# Global State
+system_enabled = True # Controlled by server weather
+start_irrigation = False
+zone_completed = False
+
+def connect_wifi():
+    wlan = network.WLAN(network.STA_IF)
+    wlan.active(True)
+    wlan.connect(WIFI_SSID, WIFI_PASS)
+    print("Connecting to WiFi...", end="")
+    while not wlan.isconnected():
+        time.sleep(0.5)
+    print("\nConnected to WiFi!")
+
+def open_gate():
+    print("Opening Gate 2...")
+    gate_servo.duty(115) 
+
+def close_gate():
+    print("Closing Gate 2...")
+    gate_servo.duty(40)  
+
+def map_sensor_to_percent(adc_val):
+    return int((adc_val / 4095.0) * 100)
+
+# --- Listen for BOTH Board 1 and the Server ---
+def mqtt_callback(topic, msg):
+    global system_enabled, start_irrigation
+    
+    # 1. Listen for Board 1's turn-over signal
+    if topic == TOPIC_SEQUENCE:
+        if msg == b"START_ZONE_2":
+            print("👉 Received sequence trigger from Zone 1!")
+            start_irrigation = True
+            if system_enabled and not zone_completed:
+                open_gate()
+                
+    # 2. Listen for Server Weather Overrides
+    elif topic == TOPIC_CONTROL:
+        try:
+            data = ujson.loads(msg)
+            command = data.get("command", "")
+            if command == "CLOSE":
+                print("☁️ SERVER OVERRIDE: Rain Expected. Pausing Gate 2.")
+                system_enabled = False
+                close_gate()
+            elif command == "OPEN":
+                print("☀️ SERVER OVERRIDE: Clear Weather. Ready.")
+                system_enabled = True
+                # Only open if it is actually our turn
+                if start_irrigation and not zone_completed:
+                    open_gate()
+        except:
+            pass
+
+def main():
+    global zone_completed
+    connect_wifi()
+    close_gate()
+    
+    client = MQTTClient(CLIENT_ID, MQTT_BROKER)
+    client.set_callback(mqtt_callback)
+    client.connect()
+    
+    # Subscribe to both topics!
+    client.subscribe(TOPIC_CONTROL)
+    client.subscribe(TOPIC_SEQUENCE)
+    print("Connected to MQTT. Waiting for turn...")
+    
+    # Idle loop: Wait for Board 1
+    while not start_irrigation:
+        client.check_msg()
+        time.sleep(0.5)
+
+    # Action loop
+    while not zone_completed:
+        client.check_msg()
+        
+        val1 = map_sensor_to_percent(s1.read())
+        val2 = map_sensor_to_percent(s2.read())
+        val3 = map_sensor_to_percent(s3.read())
+        val4 = map_sensor_to_percent(s4.read())
+        
+        overall_progress = (val1 + val2 + val3 + val4) // 4
+        
+        payload = ujson.dumps({
+            "zone": 2,
+            "progress": overall_progress
+        })
+        
+        client.publish(TOPIC_PROGRESS, payload)
+        print(f"Zone 2 Progress: {overall_progress}% -> Server")
+        
+        if overall_progress >= 95:
+            print("✅ Zone 2 Fully Watered!")
+            close_gate()
+            zone_completed = True
+            
+        time.sleep(2)
+
+if __name__ == "__main__":
+    main()
