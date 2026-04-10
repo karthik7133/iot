@@ -1,47 +1,54 @@
+import 'dart:async';
 import 'dart:convert';
 import 'package:http/http.dart' as http;
 import '../models/sensor_data.dart';
 
 class DataService {
   static const String baseUrl = 'https://iot-0ts3.onrender.com';
+  // Render free tier cold starts can take 20-40s — use a generous timeout
+  static const Duration _timeout = Duration(seconds: 45);
 
-  Future<SensorData?> fetchLatestData() async {
+  /// Wake up the Render server (free tier sleeps after inactivity)
+  Future<bool> pingServer() async {
     try {
-      final response = await http.get(Uri.parse('$baseUrl/latest'));
+      final response = await http.get(Uri.parse('$baseUrl/ping')).timeout(_timeout);
+      return response.statusCode == 200;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Fetch live zone progress + precipitation from the backend.
+  Future<ZoneData?> fetchLiveZones() async {
+    try {
+      final response = await http
+          .get(Uri.parse('$baseUrl/live-zones'))
+          .timeout(_timeout);
       if (response.statusCode == 200) {
-        return SensorData.fromJson(jsonDecode(response.body));
+        return ZoneData.fromJson(jsonDecode(response.body));
       }
     } catch (e) {
-      print('Error fetching latest data: $e');
+      // ignore — provider handles null gracefully
     }
     return null;
   }
 
-  Future<IrrigationStats?> fetchStats() async {
+  /// Fetch user/crop/location settings stored in the backend.
+  Future<Map<String, dynamic>?> fetchSettings() async {
     try {
-      final response = await http.get(Uri.parse('$baseUrl/stats'));
+      final response = await http
+          .get(Uri.parse('$baseUrl/settings'))
+          .timeout(_timeout);
       if (response.statusCode == 200) {
-        return IrrigationStats.fromJson(jsonDecode(response.body));
+        return jsonDecode(response.body) as Map<String, dynamic>;
       }
     } catch (e) {
-      print('Error fetching stats: $e');
+      // ignore
     }
     return null;
   }
 
-  Future<List<SensorData>> fetchHistory() async {
-    try {
-      final response = await http.get(Uri.parse('$baseUrl/history'));
-      if (response.statusCode == 200) {
-        List<dynamic> body = jsonDecode(response.body);
-        return body.map((dynamic item) => SensorData.fromJson(item)).toList();
-      }
-    } catch (e) {
-      print('Error fetching history: $e');
-    }
-    return [];
-  }
-
+  /// Save updated settings (crop, location, project name) to the backend.
   Future<bool> updateSettings({
     double? latitude,
     double? longitude,
@@ -49,32 +56,23 @@ class DataService {
     String? projectName,
   }) async {
     try {
-      final response = await http.post(
-        Uri.parse('$baseUrl/settings'),
-        headers: {'Content-Type': 'application/json'},
-        body: jsonEncode({
-          if (latitude != null) 'latitude': latitude,
-          if (longitude != null) 'longitude': longitude,
-          'cropType': cropType,
-          if (projectName != null) 'projectName': projectName,
-        }),
-      );
+      final response = await http
+          .post(
+            Uri.parse('$baseUrl/settings'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({
+              if (latitude != null) 'latitude': latitude,
+              if (longitude != null) 'longitude': longitude,
+              'cropType': cropType,
+              if (projectName != null) 'projectName': projectName,
+            }),
+          )
+          .timeout(_timeout);
       return response.statusCode == 200;
-    } catch (e) {
-      print('Error updating settings: $e');
+    } on TimeoutException {
+      return false;
+    } catch (_) {
       return false;
     }
-  }
-
-  Future<Map<String, dynamic>?> fetchSettings() async {
-    try {
-      final response = await http.get(Uri.parse('$baseUrl/settings'));
-      if (response.statusCode == 200) {
-        return jsonDecode(response.body) as Map<String, dynamic>;
-      }
-    } catch (e) {
-      print('Error fetching settings: $e');
-    }
-    return null;
   }
 }

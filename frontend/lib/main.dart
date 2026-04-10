@@ -31,7 +31,7 @@ class SmartIrrigationApp extends StatelessWidget {
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         brightness: Brightness.dark,
-        scaffoldBackgroundColor: Colors.transparent,
+        scaffoldBackgroundColor: const Color(0xFF0F2027),
         primaryColor: const Color(0x0000E5FF),
         textTheme: GoogleFonts.outfitTextTheme(
           Theme.of(context).textTheme.apply(bodyColor: Colors.white, displayColor: Colors.white),

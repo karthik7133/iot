@@ -1,12 +1,14 @@
 const express = require("express");
 const mongoose = require("mongoose");
 const cors = require("cors");
+const mqtt = require("mqtt");
+const https = require("https");
 
 const app = express();
 app.use(express.json());
 app.use(cors());
 
-// 1. Enhanced Global Logger
+// ─── Global Logger ────────────────────────────────────────────────────────────
 app.use((req, res, next) => {
     console.log(`\n[${new Date().toLocaleTimeString()}] 🌐 ${req.method} ${req.url}`);
     if (req.method === 'POST' || req.method === 'PUT') {
@@ -15,46 +17,39 @@ app.use((req, res, next) => {
     next();
 });
 
-// Health check
-app.get("/", (req, res) => res.send("Server is ALIVE"));
+// ─── Health Checks ────────────────────────────────────────────────────────────
+app.get("/", (req, res) => res.send("Smart Irrigation Server — ALIVE ✅"));
 app.get("/ping", (req, res) => res.send("pong"));
 
+// ─── MongoDB ──────────────────────────────────────────────────────────────────
 const MONGODB_URI = "mongodb+srv://karthik7133:Ch.karthik.7@cluster7133.yzxk6k4.mongodb.net/irrigation";
 
-// 2. Enhanced MongoDB Connection Debugging
 mongoose.connect(MONGODB_URI)
-    .then(() => console.log("✅ [DB] Successfully connected to MongoDB Atlas"))
-    .catch(err => console.error("❌ [DB] FATAL MongoDB Connection Error:", err));
+    .then(() => console.log("✅ [DB] Connected to MongoDB Atlas"))
+    .catch(err => console.error("❌ [DB] Fatal connection error:", err));
 
-// Monitor DB connection drops while the server is running
-mongoose.connection.on('error', err => {
-    console.error("❌ [DB] Mongoose runtime connection error:", err);
-});
-mongoose.connection.on('disconnected', () => {
-    console.log("⚠️ [DB] Mongoose disconnected from Atlas");
-});
+mongoose.connection.on('error', err => console.error("❌ [DB] Runtime error:", err));
+mongoose.connection.on('disconnected', () => console.log("⚠️ [DB] Mongoose disconnected"));
 
-// Schema for Sensor Data
-const DataSchema = new mongoose.Schema({
-    temperature: Number,
-    humidity: Number,
-    moisture: Number,
-    precipitation: Number,
-    motorStatus: String,
-    savedWater: Number,
-    batteryLevel: Number,
-    diseaseRisk: String,
-    time: { type: Date, default: Date.now }
-}, { collection: 'data' });
+// ─── Schemas ──────────────────────────────────────────────────────────────────
 
-const Data = mongoose.model("Data", DataSchema);
+// Zone progress snapshot saved periodically
+const ZoneLogSchema = new mongoose.Schema({
+    zone1Progress: { type: Number, default: 0 },
+    zone2Progress: { type: Number, default: 0 },
+    precipitation:  { type: Number, default: 0 },
+    gatesOpen:      { type: Boolean, default: true },
+    time:           { type: Date, default: Date.now }
+}, { collection: 'zone_logs' });
 
-// Schema for User Settings & ESP32 Config
+const ZoneLog = mongoose.model("ZoneLog", ZoneLogSchema);
+
+// Settings (location, crop type etc.) — written by the Flutter app
 const SettingsSchema = new mongoose.Schema({
     projectName: { type: String, default: "Smart Irrigation" },
-    latitude: Number,
-    longitude: Number,
-    cropType: String,
+    latitude:    Number,
+    longitude:   Number,
+    cropType:    String,
     minMoisture: Number,
     maxMoisture: Number,
     lastUpdated: { type: Date, default: Date.now }
@@ -62,144 +57,231 @@ const SettingsSchema = new mongoose.Schema({
 
 const Settings = mongoose.model("Settings", SettingsSchema);
 
-// POST settings (from App)
+// ─── In-Memory State ─────────────────────────────────────────────────────────
+const liveState = {
+    zone1: { progress: 0, updatedAt: null },
+    zone2: { progress: 0, updatedAt: null },
+    precipitation: 0,
+    precipUpdatedAt: null,
+    gatesOpen: true,
+};
+
+// ─── MQTT Client ─────────────────────────────────────────────────────────────
+const MQTT_BROKER = "mqtt://broker.hivemq.com";
+const TOPIC_ZONE1  = "smartfarm/zone1/progress";
+const TOPIC_ZONE2  = "smartfarm/zone2/progress";
+const TOPIC_CTRL   = "smartfarm/control";
+
+let mqttClient = null;
+
+function connectMQTT() {
+    console.log("🔌 [MQTT] Connecting to", MQTT_BROKER, "...");
+
+    mqttClient = mqtt.connect(MQTT_BROKER, {
+        clientId: `smart-irrigation-server-${Math.random().toString(16).slice(2, 8)}`,
+        clean: true,
+        connectTimeout: 10_000,
+        reconnectPeriod: 5_000,   // auto-reconnect every 5 s on drop
+        keepalive: 60,
+    });
+
+    mqttClient.on("connect", () => {
+        console.log("✅ [MQTT] Connected to HiveMQ broker");
+        mqttClient.subscribe([TOPIC_ZONE1, TOPIC_ZONE2], { qos: 1 }, (err) => {
+            if (err) {
+                console.error("❌ [MQTT] Subscription error:", err.message);
+            } else {
+                console.log(`📡 [MQTT] Subscribed to ${TOPIC_ZONE1} and ${TOPIC_ZONE2}`);
+            }
+        });
+    });
+
+    mqttClient.on("message", (topic, payload) => {
+        try {
+            const data = JSON.parse(payload.toString());
+            console.log(`📨 [MQTT] Message on ${topic}:`, data);
+
+            if (topic === TOPIC_ZONE1) {
+                liveState.zone1.progress  = Number(data.progress ?? data.value ?? 0);
+                liveState.zone1.updatedAt = new Date();
+            } else if (topic === TOPIC_ZONE2) {
+                liveState.zone2.progress  = Number(data.progress ?? data.value ?? 0);
+                liveState.zone2.updatedAt = new Date();
+            }
+        } catch (e) {
+            console.error("❌ [MQTT] Failed to parse message:", e.message, "| raw:", payload.toString());
+        }
+    });
+
+    mqttClient.on("reconnect", () => console.log("🔄 [MQTT] Reconnecting..."));
+    mqttClient.on("offline",   () => console.log("⚠️  [MQTT] Client offline"));
+    mqttClient.on("error",  err => console.error("❌ [MQTT] Error:", err.message));
+}
+
+// Publish a control command to all gates
+function publishGateCommand(open) {
+    if (!mqttClient || !mqttClient.connected) {
+        console.error("❌ [MQTT] Cannot publish — client not connected");
+        return;
+    }
+    const payload = JSON.stringify({ command: open ? "OPEN" : "CLOSE", timestamp: Date.now() });
+    mqttClient.publish(TOPIC_CTRL, payload, { qos: 1, retain: true }, (err) => {
+        if (err) {
+            console.error("❌ [MQTT] Publish error:", err.message);
+        } else {
+            console.log(`📤 [MQTT] Gate command sent → ${open ? "OPEN" : "CLOSE"}`);
+        }
+    });
+    liveState.gatesOpen = open;
+}
+
+// ─── Weather "Smart Brain" ────────────────────────────────────────────────────
+const WEATHER_INTERVAL_MS = 5 * 60 * 1000; // every 5 minutes
+const RAIN_THRESHOLD       = 80;            // % precipitation probability
+
+async function fetchPrecipitation(lat, lon) {
+    return new Promise((resolve, reject) => {
+        const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&hourly=precipitation_probability&forecast_days=1&timezone=auto`;
+        https.get(url, (res) => {
+            let raw = "";
+            res.on("data", chunk => (raw += chunk));
+            res.on("end", () => {
+                try {
+                    const json = JSON.parse(raw);
+                    // Get the current hour's precipitation probability
+                    const hourlyProbs = json?.hourly?.precipitation_probability ?? [];
+                    const currentHour = new Date().getHours();
+                    const prob = hourlyProbs[currentHour] ?? hourlyProbs[0] ?? 0;
+                    resolve(Number(prob));
+                } catch (e) {
+                    reject(new Error(`Weather API parse error: ${e.message}`));
+                }
+            });
+        }).on("error", reject);
+    });
+}
+
+async function runWeatherBrain() {
+    try {
+        const settings = await Settings.findOne().lean();
+        const lat = settings?.latitude  ?? 16.3;
+        const lon = settings?.longitude ?? 80.4;
+
+        console.log(`\n🌦  [Brain] Fetching weather for (${lat}, ${lon})...`);
+        const precipitation = await fetchPrecipitation(lat, lon);
+
+        liveState.precipitation   = precipitation;
+        liveState.precipUpdatedAt = new Date();
+        console.log(`🌧  [Brain] Precipitation probability: ${precipitation}%`);
+
+        if (precipitation > RAIN_THRESHOLD) {
+            console.log(`🚫 [Brain] Rain likely (${precipitation}% > ${RAIN_THRESHOLD}%) → CLOSING all gates`);
+            publishGateCommand(false); // CLOSE / STOP
+        } else {
+            console.log(`✅ [Brain] Rain unlikely (${precipitation}% ≤ ${RAIN_THRESHOLD}%) → Gates OPEN`);
+            publishGateCommand(true);  // OPEN / proceed
+        }
+
+        // Persist a snapshot to MongoDB
+        await new ZoneLog({
+            zone1Progress: liveState.zone1.progress,
+            zone2Progress: liveState.zone2.progress,
+            precipitation,
+            gatesOpen: liveState.gatesOpen,
+        }).save();
+        console.log("💾 [Brain] Snapshot saved to MongoDB");
+
+    } catch (err) {
+        console.error("❌ [Brain] Error in weather brain loop:", err.message);
+    }
+}
+
+// ─── REST API ─────────────────────────────────────────────────────────────────
+
+// GET /live-zones — Flutter app polls this every 3 seconds
+app.get("/live-zones", (req, res) => {
+    res.json({
+        zone1: {
+            progress: liveState.zone1.progress,
+            updatedAt: liveState.zone1.updatedAt,
+        },
+        zone2: {
+            progress: liveState.zone2.progress,
+            updatedAt: liveState.zone2.updatedAt,
+        },
+        precipitation:    liveState.precipitation,
+        precipUpdatedAt:  liveState.precipUpdatedAt,
+        gatesOpen:        liveState.gatesOpen,
+        rainThreshold:    RAIN_THRESHOLD,
+    });
+});
+
+// POST /settings — Flutter app saves location & crop
 app.post("/settings", async (req, res) => {
     try {
         let settings = await Settings.findOne();
-        if (!settings) settings = new Settings(); // Create new if it doesn't exist
+        if (!settings) settings = new Settings();
 
         const { latitude, longitude, cropType, projectName } = req.body;
 
-        if (latitude !== undefined) settings.latitude = latitude;
-        if (longitude !== undefined) settings.longitude = longitude;
+        if (latitude    !== undefined) settings.latitude    = latitude;
+        if (longitude   !== undefined) settings.longitude   = longitude;
         if (projectName !== undefined) settings.projectName = projectName;
 
-        // Only update thresholds if a cropType was explicitly sent
         if (cropType !== undefined) {
             settings.cropType = cropType;
-            if (cropType === "Rice") {
-                settings.minMoisture = 60;
-                settings.maxMoisture = 80;
-            } else if (cropType === "Tomato") {
-                settings.minMoisture = 40;
-                settings.maxMoisture = 60;
-            } else if (cropType === "Cotton") {
-                settings.minMoisture = 30;
-                settings.maxMoisture = 50;
-            } else {
-                settings.minMoisture = 40;
-                settings.maxMoisture = 70;
-            }
+            const thresholds = {
+                Rice:   { min: 60, max: 80 },
+                Tomato: { min: 40, max: 60 },
+                Cotton: { min: 30, max: 50 },
+            };
+            const t = thresholds[cropType] ?? { min: 40, max: 70 };
+            settings.minMoisture = t.min;
+            settings.maxMoisture = t.max;
         }
 
         settings.lastUpdated = Date.now();
         await settings.save();
-        console.log("✅ [DB] Settings updated successfully");
+        console.log("✅ [DB] Settings updated");
         res.json({ message: "Settings Updated", settings });
     } catch (err) {
-        console.error("❌ [POST /settings] Error:", err.message);
+        console.error("❌ [POST /settings]", err.message);
         res.status(500).json({ error: err.message });
     }
 });
 
-// GET settings (for ESP32)
+// GET /settings — for internal use / app config fetch
 app.get("/settings", async (req, res) => {
     try {
         const settings = await Settings.findOne();
         if (!settings) {
-            console.log("⚠️ [GET /settings] No settings found, sending defaults.");
-            return res.json({
-                latitude: 16.3,
-                longitude: 80.4,
-                minMoisture: 40,
-                maxMoisture: 70
-            });
+            return res.json({ latitude: 16.3, longitude: 80.4, minMoisture: 40, maxMoisture: 70 });
         }
-        console.log("📤 [GET /settings] Sending settings to ESP32");
         res.json(settings);
     } catch (err) {
-        console.error("❌ [GET /settings] Error:", err.message);
+        console.error("❌ [GET /settings]", err.message);
         res.status(500).json({ error: err.message });
     }
 });
 
-// 3. Enhanced POST Data Debugging
-app.post("/data", async (req, res) => {
-    try {
-        console.log("📥 [POST /data] Processing incoming sensor data...");
-        const { temperature, humidity } = req.body;
-
-        let diseaseRisk = "LOW";
-        if (temperature && humidity && temperature > 25 && humidity > 80) {
-            diseaseRisk = "HIGH";
-        }
-
-        const data = new Data({
-            ...req.body,
-            diseaseRisk
-        });
-
-        // Explicit validation check before saving
-        const validationError = data.validateSync();
-        if (validationError) {
-            console.error("❌ [DB Validation Error]:", validationError.errors);
-            return res.status(400).send("Validation Error");
-        }
-
-        const savedData = await data.save();
-        console.log("✅ [DB] Data securely saved! Document ID:", savedData._id);
-        res.status(201).send("Saved");
-    } catch (err) {
-        console.error("❌ [POST /data] Critical Error saving to DB:", err);
-        res.status(500).send(err.message);
-    }
-});
-
-// Latest data
-app.get("/latest", async (req, res) => {
-    try {
-        const latest = await Data.findOne().sort({ time: -1 });
-        if (!latest) {
-            console.log("⚠️ [GET /latest] DB is empty.");
-            return res.json({});
-        }
-        res.json(latest);
-    } catch (err) {
-        console.error("❌ [GET /latest] Error:", err.message);
-        res.status(500).json({ error: err.message });
-    }
-});
-
-// History for graphs
+// GET /history — last 50 zone log snapshots
 app.get("/history", async (req, res) => {
     try {
-        const history = await Data.find().sort({ time: 1 });
-        res.json(history);
+        const logs = await ZoneLog.find().sort({ time: -1 }).limit(50).lean();
+        res.json(logs.reverse());
     } catch (err) {
-        console.error("❌ [GET /history] Error:", err.message);
+        console.error("❌ [GET /history]", err.message);
         res.status(500).json({ error: err.message });
     }
 });
 
-// Water saving stats
-app.get("/stats", async (req, res) => {
-    try {
-        const records = await Data.find();
-        const total = records.length;
-
-        const motorOffDueToRain = records.filter(
-            r => r.motorStatus === "OFF" && r.precipitation > 80
-        ).length;
-
-        const saved = total === 0 ? 0 : (motorOffDueToRain / total) * 100;
-        res.json({ waterSavedPercent: saved.toFixed(2) });
-    } catch (err) {
-        console.error("❌ [GET /stats] Error:", err.message);
-        res.status(500).json({ error: err.message });
-    }
-});
-
+// ─── Bootstrap ────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, "0.0.0.0", () => {
-    console.log(`🚀 Server running on port ${PORT}`);
+    console.log(`\n🚀 Server running on port ${PORT}`);
+    connectMQTT();
+
+    // Run weather brain immediately, then on interval
+    setTimeout(runWeatherBrain, 3000);
+    setInterval(runWeatherBrain, WEATHER_INTERVAL_MS);
 });

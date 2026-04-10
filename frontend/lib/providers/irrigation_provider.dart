@@ -5,19 +5,17 @@ import '../services/data_service.dart';
 
 class IrrigationProvider with ChangeNotifier {
   final DataService _dataService = DataService();
-  
-  SensorData? _latestData;
-  IrrigationStats? _stats;
-  List<SensorData> _history = [];
+
+  ZoneData _zoneData = ZoneData.empty();
   Map<String, dynamic>? _settings;
   bool _isLoading = true;
+  bool _hasError = false;
   Timer? _timer;
 
-  SensorData? get latestData => _latestData;
-  IrrigationStats? get stats => _stats;
-  List<SensorData> get history => _history;
+  ZoneData get zoneData => _zoneData;
   Map<String, dynamic>? get settings => _settings;
   bool get isLoading => _isLoading;
+  bool get hasError => _hasError;
 
   IrrigationProvider() {
     _init();
@@ -27,34 +25,44 @@ class IrrigationProvider with ChangeNotifier {
     await refreshData();
     _isLoading = false;
     notifyListeners();
-    
-    // Silent polling every 10 seconds
-    _timer = Timer.periodic(Duration(seconds: 10), (timer) async {
-      await refreshData();
-    });
+
+    // Poll every 3 seconds for a near real-time feel
+    _timer = Timer.periodic(const Duration(seconds: 3), (_) => _silentRefresh());
   }
 
-  Future<void> refreshData() async {
-    final futures = await Future.wait([
-      _dataService.fetchLatestData(),
-      _dataService.fetchStats(),
-      _dataService.fetchHistory(),
-      _dataService.fetchSettings(),
-    ]);
+  // Called by the init timer — does NOT flip isLoading to avoid UI flicker
+  Future<void> _silentRefresh() async {
+    try {
+      final zones = await _dataService.fetchLiveZones();
+      if (zones != null) {
+        _zoneData = zones;
+        _hasError = false;
+      }
+    } catch (_) {
+      _hasError = true;
+    }
+    notifyListeners();
+  }
 
-    _latestData = futures[0] as SensorData?;
-    _stats = futures[1] as IrrigationStats?;
-    _history = futures[2] as List<SensorData>;
-    _settings = futures[3] as Map<String, dynamic>?;
-    
+  // Full refresh — reloads both zone data AND settings (used on pull-to-refresh)
+  Future<void> refreshData() async {
+    _hasError = false;
+    try {
+      final results = await Future.wait([
+        _dataService.fetchLiveZones(),
+        _dataService.fetchSettings(),
+      ]);
+      if (results[0] != null) _zoneData = results[0] as ZoneData;
+      if (results[1] != null) _settings = results[1] as Map<String, dynamic>;
+    } catch (_) {
+      _hasError = true;
+    }
     notifyListeners();
   }
 
   Future<bool> updateCrop(String newCrop) async {
     final success = await _dataService.updateSettings(cropType: newCrop);
-    if (success) {
-      await refreshData();
-    }
+    if (success) await refreshData();
     return success;
   }
 

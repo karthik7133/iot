@@ -1,13 +1,414 @@
+import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:provider/provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:percent_indicator/circular_percent_indicator.dart';
 import 'package:intl/intl.dart';
 import '../providers/irrigation_provider.dart';
+import '../models/sensor_data.dart';
 import '../widgets/glass_card.dart';
 import 'analytics_screen.dart';
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Colours
+const _bgDark   = Color(0xFF0F2027);
+const _bgMid    = Color(0xFF203A43);
+const _cyan     = Color(0xFF00E5FF);
+const _green    = Color(0xFF00E676);
+const _red      = Color(0xFFD50000);
+const _orange   = Color(0xFFFF9100);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Liquid Wave CustomPainter
+class _LiquidPainter extends CustomPainter {
+  final double progress;   // 0.0 – 1.0
+  final Color color;
+  final double waveOffset; // animated phase offset
+
+  _LiquidPainter({
+    required this.progress,
+    required this.color,
+    required this.waveOffset,
+  });
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final fillHeight = size.height * (1.0 - progress.clamp(0.0, 1.0));
+
+    // Draw wave
+    final wavePaint = Paint()..color = color.withOpacity(0.85);
+    final path = Path();
+
+    path.moveTo(0, fillHeight);
+    for (double x = 0; x <= size.width; x++) {
+      final y = fillHeight +
+          math.sin((x / size.width * 2 * math.pi) + waveOffset) * 6 +
+          math.sin((x / size.width * 4 * math.pi) + waveOffset * 1.5) * 3;
+      path.lineTo(x, y);
+    }
+    path.lineTo(size.width, size.height);
+    path.lineTo(0, size.height);
+    path.close();
+    canvas.drawPath(path, wavePaint);
+
+    // Slightly brighter second wave layer
+    final wavePaint2 = Paint()..color = color.withOpacity(0.4);
+    final path2 = Path();
+    path2.moveTo(0, fillHeight + 4);
+    for (double x = 0; x <= size.width; x++) {
+      final y = fillHeight +
+          4 +
+          math.sin((x / size.width * 2 * math.pi) + waveOffset + 1.0) * 5;
+      path2.lineTo(x, y);
+    }
+    path2.lineTo(size.width, size.height);
+    path2.lineTo(0, size.height);
+    path2.close();
+    canvas.drawPath(path2, wavePaint2);
+  }
+
+  @override
+  bool shouldRepaint(_LiquidPainter old) =>
+      old.progress != progress || old.waveOffset != waveOffset;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Animated Liquid Zone Card
+class _ZoneCard extends StatefulWidget {
+  final int zoneNumber;
+  final int progress; // 0 – 100
+  final bool gatesOpen;
+
+  const _ZoneCard({
+    required this.zoneNumber,
+    required this.progress,
+    required this.gatesOpen,
+  });
+
+  @override
+  State<_ZoneCard> createState() => _ZoneCardState();
+}
+
+class _ZoneCardState extends State<_ZoneCard> with SingleTickerProviderStateMixin {
+  late AnimationController _waveCtrl;
+  double _waveOffset = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    _waveCtrl = AnimationController(
+      vsync: this,
+      duration: const Duration(seconds: 3),
+    )..repeat();
+
+    _waveCtrl.addListener(() {
+      setState(() => _waveOffset = _waveCtrl.value * 2 * math.pi);
+    });
+  }
+
+  @override
+  void dispose() {
+    _waveCtrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final int progress  = widget.progress.clamp(0, 100);
+    final isComplete = progress >= 100;
+    final isStopped  = !widget.gatesOpen;
+    final borderColor = isComplete
+        ? _green
+        : (isStopped ? _orange : _cyan.withOpacity(0.5));
+    final liquidColor = isComplete ? _green : _cyan;
+    final progressF   = progress / 100.0;
+
+    return Container(
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(28),
+        border: Border.all(color: borderColor, width: isComplete ? 2 : 1),
+        boxShadow: [
+          BoxShadow(
+            color: (isComplete ? _green : _cyan).withOpacity(0.2),
+            blurRadius: 20,
+            spreadRadius: isComplete ? 4 : 2,
+          ),
+        ],
+      ),
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(27),
+        child: Stack(
+          children: [
+            // Background
+            Container(color: _bgDark),
+
+            // Liquid fill
+            Positioned.fill(
+              child: CustomPaint(
+                painter: _LiquidPainter(
+                  progress: progressF,
+                  color: liquidColor,
+                  waveOffset: _waveOffset,
+                ),
+              ),
+            ),
+
+            // Glass overlay
+            Positioned.fill(
+              child: Container(
+                decoration: BoxDecoration(
+                  gradient: LinearGradient(
+                    begin: Alignment.topCenter,
+                    end: Alignment.bottomCenter,
+                    colors: [
+                      Colors.white.withOpacity(0.04),
+                      Colors.transparent,
+                    ],
+                  ),
+                ),
+              ),
+            ),
+
+            // Text content
+            Padding(
+              padding: const EdgeInsets.all(18.0),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  // Zone header
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      Text(
+                        "Zone ${widget.zoneNumber}",
+                        style: GoogleFonts.outfit(
+                          fontSize: 13,
+                          fontWeight: FontWeight.w600,
+                          color: Colors.white70,
+                          letterSpacing: 1.5,
+                        ),
+                      ),
+                      _StatusPill(complete: isComplete, stopped: isStopped),
+                    ],
+                  ),
+
+                  const Spacer(),
+
+                  // Big percentage
+                  Text(
+                    "$progress%",
+                    style: GoogleFonts.outfit(
+                      fontSize: 44,
+                      fontWeight: FontWeight.bold,
+                      color: isComplete ? _green : Colors.white,
+                    ),
+                  ),
+
+                  // Sub-label
+                  Text(
+                    isComplete
+                        ? "✔  Irrigation Complete"
+                        : isStopped
+                            ? "⏸  Gates Closed"
+                            : "Filling...",
+                    style: GoogleFonts.outfit(
+                      fontSize: 12,
+                      color: isComplete
+                          ? _green
+                          : isStopped
+                              ? _orange
+                              : Colors.white60,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+
+                  // Thin progress bar
+                  ClipRRect(
+                    borderRadius: BorderRadius.circular(4),
+                    child: LinearProgressIndicator(
+                      value: progressF.clamp(0.0, 1.0),
+                      minHeight: 4,
+                      backgroundColor: Colors.white12,
+                      valueColor: AlwaysStoppedAnimation<Color>(liquidColor),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// Status pill badge
+class _StatusPill extends StatelessWidget {
+  final bool complete;
+  final bool stopped;
+  const _StatusPill({required this.complete, required this.stopped});
+
+  @override
+  Widget build(BuildContext context) {
+    final Color color = complete ? _green : (stopped ? _orange : _cyan);
+    final String label = complete ? "DONE" : (stopped ? "PAUSED" : "LIVE");
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+      decoration: BoxDecoration(
+        color: color.withOpacity(0.15),
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: color.withOpacity(0.5)),
+      ),
+      child: Text(
+        label,
+        style: GoogleFonts.outfit(
+          fontSize: 10,
+          fontWeight: FontWeight.bold,
+          color: color,
+          letterSpacing: 1.2,
+        ),
+      ),
+    );
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Precipitation / weather banner
+class _PrecipBanner extends StatelessWidget {
+  final double precipitation;
+  final bool gatesOpen;
+  final int threshold;
+
+  const _PrecipBanner({
+    required this.precipitation,
+    required this.gatesOpen,
+    required this.threshold,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final bool rainLikely = precipitation > threshold;
+    final Color accent = rainLikely ? _orange : _green;
+    final String text = rainLikely
+        ? "Rain likely (${precipitation.toInt()}%) — Gates closed to save water"
+        : "No rain (${precipitation.toInt()}%) — Irrigation active";
+
+    return GlassCard(
+      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
+      child: Row(
+        children: [
+          Icon(
+            rainLikely ? Icons.umbrella_rounded : Icons.wb_sunny_rounded,
+            color: accent,
+            size: 26,
+          ),
+          const SizedBox(width: 14),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  rainLikely ? "Rain Alert" : "Clear Weather",
+                  style: GoogleFonts.outfit(
+                    fontWeight: FontWeight.bold,
+                    color: Colors.white,
+                    fontSize: 14,
+                  ),
+                ),
+                Text(
+                  text,
+                  style: GoogleFonts.outfit(color: Colors.white60, fontSize: 12),
+                ),
+              ],
+            ),
+          ),
+          Text(
+            "${precipitation.toInt()}%",
+            style: GoogleFonts.outfit(
+              fontSize: 22,
+              fontWeight: FontWeight.bold,
+              color: accent,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Overall fill summary (average of both zones)
+class _OverallProgress extends StatelessWidget {
+  final int zone1;
+  final int zone2;
+  const _OverallProgress({required this.zone1, required this.zone2});
+
+  @override
+  Widget build(BuildContext context) {
+    final avg = ((zone1 + zone2) / 2).round();
+    final bool done = avg >= 100;
+    return GlassCard(
+      padding: const EdgeInsets.all(20),
+      child: Row(
+        children: [
+          SizedBox(
+            width: 60,
+            height: 60,
+            child: Stack(
+              alignment: Alignment.center,
+              children: [
+                SizedBox(
+                  width: 60,
+                  height: 60,
+                  child: CircularProgressIndicator(
+                    value: avg / 100,
+                    strokeWidth: 6,
+                    backgroundColor: Colors.white12,
+                    valueColor: AlwaysStoppedAnimation<Color>(done ? _green : _cyan),
+                    strokeCap: StrokeCap.round,
+                  ),
+                ),
+                Text(
+                  "$avg%",
+                  style: GoogleFonts.outfit(
+                    fontSize: 13,
+                    fontWeight: FontWeight.bold,
+                    color: Colors.white,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(width: 18),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  "Overall Field Progress",
+                  style: GoogleFonts.outfit(
+                    fontWeight: FontWeight.bold,
+                    color: Colors.white,
+                    fontSize: 15,
+                  ),
+                ),
+                Text(
+                  done
+                      ? "All zones fully irrigated 🎉"
+                      : "Zone 1: $zone1% · Zone 2: $zone2%",
+                  style: GoogleFonts.outfit(color: Colors.white54, fontSize: 12),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Main Dashboard Screen
 class DashboardScreen extends StatefulWidget {
   const DashboardScreen({super.key});
 
@@ -15,33 +416,22 @@ class DashboardScreen extends StatefulWidget {
   _DashboardScreenState createState() => _DashboardScreenState();
 }
 
-class _DashboardScreenState extends State<DashboardScreen> with SingleTickerProviderStateMixin {
-  String _projectName = "System";
-  String _location = "Loading...";
-  late AnimationController _pulseController;
+class _DashboardScreenState extends State<DashboardScreen> {
+  String _projectName = "Smart Field";
+  String _location    = "Loading...";
 
   @override
   void initState() {
     super.initState();
     _loadPrefs();
-    _pulseController = AnimationController(
-      vsync: this,
-      duration: const Duration(seconds: 2),
-    )..repeat(reverse: true);
   }
 
   void _loadPrefs() async {
     final prefs = await SharedPreferences.getInstance();
     setState(() {
       _projectName = prefs.getString("project_name") ?? "Smart Field";
-      _location = prefs.getString("location") ?? "Unknown";
+      _location    = prefs.getString("location") ?? "Unknown Location";
     });
-  }
-
-  @override
-  void dispose() {
-    _pulseController.dispose();
-    super.dispose();
   }
 
   @override
@@ -52,28 +442,29 @@ class _DashboardScreenState extends State<DashboardScreen> with SingleTickerProv
           gradient: LinearGradient(
             begin: Alignment.topLeft,
             end: Alignment.bottomRight,
-            colors: [Color(0xFF0F2027), Color(0xFF203A43)],
+            colors: [_bgDark, _bgMid],
           ),
         ),
         child: Consumer<IrrigationProvider>(
-          builder: (context, provider, child) {
-            final data = provider.latestData;
-            final isMotorOn = data?.motorStatus == "ON";
+          builder: (context, provider, _) {
+            final data = provider.zoneData;
 
             return RefreshIndicator(
               onRefresh: provider.refreshData,
-              backgroundColor: const Color(0xFF203A43),
-              color: const Color(0xFF00E5FF),
+              backgroundColor: _bgMid,
+              color: _cyan,
               child: CustomScrollView(
                 slivers: [
                   SliverSafeArea(
                     sliver: SliverToBoxAdapter(
                       child: Padding(
-                        padding: const EdgeInsets.symmetric(horizontal: 25.0),
+                        padding: const EdgeInsets.symmetric(horizontal: 22.0),
                         child: Column(
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
                             const SizedBox(height: 20),
+
+                            // ── Header Row ──────────────────────────────
                             Row(
                               mainAxisAlignment: MainAxisAlignment.spaceBetween,
                               children: [
@@ -81,85 +472,128 @@ class _DashboardScreenState extends State<DashboardScreen> with SingleTickerProv
                                   crossAxisAlignment: CrossAxisAlignment.start,
                                   children: [
                                     Text(
-                                      "Good Morning,",
-                                      style: GoogleFonts.outfit(color: Colors.white70, fontSize: 16),
+                                      "Smart Irrigation",
+                                      style: GoogleFonts.outfit(color: Colors.white54, fontSize: 14),
                                     ),
                                     Text(
                                       _projectName,
                                       style: GoogleFonts.outfit(
-                                        fontSize: 28,
+                                        fontSize: 26,
                                         fontWeight: FontWeight.bold,
                                         color: Colors.white,
                                       ),
                                     ),
                                   ],
                                 ),
-                                GlassCard(
-                                  padding: const EdgeInsets.all(10),
-                                  borderRadius: 12,
-                                  child: Icon(Icons.notifications_none, color: Theme.of(context).colorScheme.primary),
+                                Row(
+                                  children: [
+                                    GlassCard(
+                                      padding: const EdgeInsets.all(10),
+                                      borderRadius: 12,
+                                      child: const Icon(Icons.notifications_none, color: _cyan),
+                                    ),
+                                    const SizedBox(width: 10),
+                                    GestureDetector(
+                                      onTap: () => _showSettingsSheet(context, provider),
+                                      child: const GlassCard(
+                                        padding: EdgeInsets.all(10),
+                                        borderRadius: 12,
+                                        child: Icon(Icons.tune_rounded, color: Colors.white70),
+                                      ),
+                                    ),
+                                  ],
                                 ),
-                                const SizedBox(width: 10),
-                                GestureDetector(
-                                  onTap: () => _showSettingsBottomSheet(context, provider),
-                                  child: const GlassCard(
-                                    padding: EdgeInsets.all(10),
-                                    borderRadius: 12,
-                                    child: Icon(Icons.settings, color: Colors.white70),
-                                  ),
-                                )
                               ],
                             ),
-                            const SizedBox(height: 10),
+
+                            const SizedBox(height: 8),
+
+                            // Location & Date row
                             Row(
                               children: [
-                                const Icon(Icons.location_on, color: Color(0xFF00E5FF), size: 16),
-                                const SizedBox(width: 5),
+                                const Icon(Icons.location_on, color: _cyan, size: 15),
+                                const SizedBox(width: 4),
                                 Text(
                                   _location,
-                                  style: GoogleFonts.outfit(color: Colors.white54, fontSize: 14),
+                                  style: GoogleFonts.outfit(color: Colors.white54, fontSize: 13),
                                 ),
                                 const Spacer(),
                                 Text(
                                   DateFormat('EEE, MMM d').format(DateTime.now()),
-                                  style: GoogleFonts.outfit(color: Colors.white54, fontSize: 14),
+                                  style: GoogleFonts.outfit(color: Colors.white38, fontSize: 13),
                                 ),
                               ],
                             ),
-                            const SizedBox(height: 30),
-                            
-                            // Hero: Digital Twin & Motor Status
-                            _buildHeroSection(data, isMotorOn),
-                            
-                            const SizedBox(height: 30),
-                            Text("Real-time Metrics", style: GoogleFonts.outfit(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 18)),
-                            const SizedBox(height: 15),
-                            
-                            // 2x2 Grid
-                            GridView.count(
-                              shrinkWrap: true,
-                              physics: const NeverScrollableScrollPhysics(),
-                              crossAxisCount: 2,
-                              crossAxisSpacing: 15,
-                              mainAxisSpacing: 15,
-                              childAspectRatio: 1.1,
-                              children: [
-                                _buildTile("Soil Moisture", "${data?.moisture ?? '--'}%", Icons.water_drop, const Color(0xFF00E5FF)),
-                                _buildTile("Precipitation", "${data?.precipitation ?? '--'}%", Icons.cloudy_snowing, Colors.white70),
-                                _buildTile("Temperature", "${data?.temperature ?? '--'}°C", Icons.thermostat, const Color(0xFFFF9100)),
-                                _buildTile("Battery Health", "${data?.batteryLevel.toInt() ?? '--'}%", 
-                                    (data?.batteryLevel ?? 100) > 30 ? Icons.battery_full : Icons.battery_alert, 
-                                    (data?.batteryLevel ?? 100) > 30 ? const Color(0xFF00E676) : const Color(0xFFD50000)),
-                              ],
+
+                            const SizedBox(height: 28),
+
+                            // ── Weather / Precipitation Banner ───────────
+                            _PrecipBanner(
+                              precipitation: data.precipitation,
+                              gatesOpen:     data.gatesOpen,
+                              threshold:     data.rainThreshold,
                             ),
-                            
-                            const SizedBox(height: 30),
-                            Text("AI Intelligence", style: GoogleFonts.outfit(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 18)),
-                            const SizedBox(height: 15),
-                            
-                            // AI Insight Cards
-                            _buildAIInsights(data, provider.stats?.waterSavedPercent ?? "0.0"),
-                            
+
+                            const SizedBox(height: 22),
+
+                            // ── Section Label ────────────────────────────
+                            Text(
+                              "Sequential Zone Irrigation",
+                              style: GoogleFonts.outfit(
+                                fontSize: 17,
+                                fontWeight: FontWeight.bold,
+                                color: Colors.white,
+                              ),
+                            ),
+                            const SizedBox(height: 4),
+                            Text(
+                              "Live water flow progress per column",
+                              style: GoogleFonts.outfit(fontSize: 12, color: Colors.white38),
+                            ),
+                            const SizedBox(height: 14),
+
+                            // ── 2-Column Zone Cards ──────────────────────
+                            AspectRatio(
+                              aspectRatio: 1.05,
+                              child: Row(
+                                children: [
+                                  Expanded(
+                                    child: _ZoneCard(
+                                      zoneNumber: 1,
+                                      progress:   data.zone1Progress,
+                                      gatesOpen:  data.gatesOpen,
+                                    ),
+                                  ),
+                                  const SizedBox(width: 14),
+                                  Expanded(
+                                    child: _ZoneCard(
+                                      zoneNumber: 2,
+                                      progress:   data.zone2Progress,
+                                      gatesOpen:  data.gatesOpen,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+
+                            const SizedBox(height: 18),
+
+                            // ── Overall Progress Summary ──────────────────
+                            _OverallProgress(
+                              zone1: data.zone1Progress,
+                              zone2: data.zone2Progress,
+                            ),
+
+                            const SizedBox(height: 22),
+
+                            // ── MQTT / Gate Status row ─────────────────
+                            _buildGateStatusRow(data, provider),
+
+                            const SizedBox(height: 28),
+
+                            // ── Crop Settings shortcut ───────────────────
+                            _buildCropInfo(provider),
+
                             const SizedBox(height: 100),
                           ],
                         ),
@@ -173,220 +607,138 @@ class _DashboardScreenState extends State<DashboardScreen> with SingleTickerProv
         ),
       ),
       floatingActionButton: FloatingActionButton.extended(
-        onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (context) => const AnalyticsScreen())),
+        onPressed: () => Navigator.push(
+          context,
+          MaterialPageRoute(builder: (_) => const AnalyticsScreen()),
+        ),
         label: Text("Insights", style: GoogleFonts.outfit(fontWeight: FontWeight.bold)),
         icon: const Icon(Icons.auto_graph),
-        backgroundColor: const Color(0xFF00E5FF).withOpacity(0.9),
+        backgroundColor: _cyan.withOpacity(0.9),
+        foregroundColor: Colors.black,
       ),
     );
   }
 
-  Widget _buildHeroSection(dynamic data, bool isMotorOn) {
-    return Consumer<IrrigationProvider>(
-      builder: (context, provider, child) {
-        final settings = provider.settings;
-        final crop = settings?['cropType'] ?? "Field";
-        bool isDry = (data?.moisture ?? 50) < (settings?['minMoisture'] ?? 40);
-        
-        return GlassCard(
-          padding: const EdgeInsets.all(25),
-          child: Row(
-            children: [
-              Stack(
-                alignment: Alignment.center,
-                children: [
-                  if (isMotorOn)
-                    ScaleTransition(
-                      scale: Tween(begin: 1.0, end: 1.4).animate(
-                        CurvedAnimation(parent: _pulseController, curve: Curves.easeInOut),
-                      ),
-                      child: Container(
-                        width: 80,
-                        height: 80,
-                        decoration: BoxDecoration(
-                          shape: BoxShape.circle,
-                          color: const Color(0xFF00E676).withOpacity(0.15),
-                        ),
-                      ),
-                    ),
-                  Container(
-                    width: 70,
-                    height: 70,
-                    decoration: BoxDecoration(
-                      shape: BoxShape.circle,
-                      color: isMotorOn ? const Color(0xFF00E676).withOpacity(0.2) : Colors.white.withOpacity(0.05),
-                    ),
-                    child: Center(
-                      child: Icon(
-                        Icons.local_florist,
-                        size: 35,
-                        color: isDry ? const Color(0xFF8D6E63) : const Color(0xFF00E676),
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-              const SizedBox(width: 25),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      isMotorOn ? "Motor Pulsing" : "$crop Status",
-                      style: GoogleFonts.outfit(
-                        fontSize: 20,
-                        fontWeight: FontWeight.bold,
-                        color: Colors.white,
-                      ),
-                    ),
-                    Text(
-                      isMotorOn ? "Hydrating your field..." : (isDry ? "Needs Attention" : "Ideal Conditions"),
-                      style: GoogleFonts.outfit(color: Colors.white70, fontSize: 13),
-                    ),
-                    if (isMotorOn)
-                      Padding(
-                        padding: const EdgeInsets.only(top: 8.0),
-                        child: Row(
-                          children: [
-                            Container(width: 8, height: 8, decoration: const BoxDecoration(color: Color(0xFF00E676), shape: BoxShape.circle)),
-                            const SizedBox(width: 5),
-                            const Text("ACTIVE", style: TextStyle(color: Color(0xFF00E676), fontSize: 10, fontWeight: FontWeight.bold)),
-                          ],
-                        ),
-                      )
-                  ],
-                ),
-              )
-            ],
-          ),
-        );
-      },
-    );
-  }
-
-  Widget _buildTile(String label, String value, IconData icon, Color color) {
-    return GlassCard(
-      padding: const EdgeInsets.all(15),
-      child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Container(
-            padding: const EdgeInsets.all(8),
-            decoration: BoxDecoration(
-              color: color.withOpacity(0.1),
-              borderRadius: BorderRadius.circular(10),
-            ),
-            child: Icon(icon, color: color, size: 20),
-          ),
-          const SizedBox(height: 12),
-          Text(value, style: GoogleFonts.outfit(fontSize: 24, fontWeight: FontWeight.bold, color: Colors.white)),
-          Text(label, style: GoogleFonts.outfit(fontSize: 12, color: Colors.white54)),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildAIInsights(dynamic data, String waterSaved) {
-    bool isHighRisk = data?.diseaseRisk == "HIGH";
-    
-    return Column(
+  // ── Gate Status ─────────────────────────────────────────────────────────────
+  Widget _buildGateStatusRow(ZoneData data, IrrigationProvider provider) {
+    return Row(
       children: [
-        // Disease Risk Card
-        Container(
-          decoration: BoxDecoration(
-            borderRadius: BorderRadius.circular(24),
-            boxShadow: isHighRisk ? [
-              BoxShadow(color: const Color(0xFFD50000).withOpacity(0.3), blurRadius: 20, spreadRadius: 2)
-            ] : []
-          ),
+        Expanded(
           child: GlassCard(
-            padding: const EdgeInsets.all(20),
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
             child: Row(
               children: [
-                Icon(Icons.warning_amber_rounded, color: isHighRisk ? const Color(0xFFD50000) : const Color(0xFF00E676)),
-                const SizedBox(width: 15),
+                Container(
+                  width: 10,
+                  height: 10,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: data.gatesOpen ? _green : _orange,
+                  ),
+                ),
+                const SizedBox(width: 10),
                 Expanded(
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Text("Disease Prediction", style: GoogleFonts.outfit(fontWeight: FontWeight.bold, color: Colors.white)),
+                      Text("Gate Status", style: GoogleFonts.outfit(color: Colors.white54, fontSize: 11)),
                       Text(
-                        isHighRisk ? "Warning: High humidity detected. Fungal risk elevated." : "Risk Level: Low. Continue monitoring.",
-                        style: GoogleFonts.outfit(color: Colors.white70, fontSize: 12),
+                        data.gatesOpen ? "OPEN" : "CLOSED",
+                        style: GoogleFonts.outfit(
+                          fontWeight: FontWeight.bold,
+                          color: data.gatesOpen ? _green : _orange,
+                        ),
                       ),
                     ],
                   ),
                 ),
-                Text(isHighRisk ? "HIGH" : "LOW", style: TextStyle(color: isHighRisk ? const Color(0xFFD50000) : const Color(0xFF00E676), fontWeight: FontWeight.bold)),
               ],
             ),
           ),
         ),
-        const SizedBox(height: 15),
-        
-        // Yield & Water Saved
-        Row(
-          children: [
-            Expanded(
-              child: GlassCard(
-                padding: const EdgeInsets.all(20),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text("Yield Health", style: GoogleFonts.outfit(color: Colors.white70, fontSize: 13)),
-                    const SizedBox(height: 5),
-                    Text("${data?.yieldHealth.toInt() ?? '--'}%", style: GoogleFonts.outfit(fontSize: 22, fontWeight: FontWeight.bold, color: const Color(0xFF00E676))),
-                    const Text("Stable Monitoring", style: TextStyle(color: Colors.white38, fontSize: 10)),
-                  ],
-                ),
-              ),
-            ),
-            const SizedBox(width: 15),
-            Expanded(
-              child: GlassCard(
-                padding: const EdgeInsets.all(15),
-                child: Row(
-                  children: [
-                    CircularPercentIndicator(
-                      radius: 25.0,
-                      lineWidth: 4.0,
-                      percent: (double.tryParse(waterSaved) ?? 0) / 100,
-                      center: Text("${waterSaved.split('.')[0]}%", style: const TextStyle(fontSize: 8, color: Colors.white)),
-                      progressColor: const Color(0xFF00E5FF),
-                      backgroundColor: Colors.white10,
-                      circularStrokeCap: CircularStrokeCap.round,
-                    ),
-                    const SizedBox(width: 10),
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          const Text("Saved", style: TextStyle(color: Colors.white70, fontSize: 11)),
-                          Text("${waterSaved.split('.')[0]}%", style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.white)),
-                        ],
+        const SizedBox(width: 12),
+        Expanded(
+          child: GlassCard(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+            child: Row(
+              children: [
+                Icon(Icons.water, color: _cyan, size: 22),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text("Rain Risk", style: GoogleFonts.outfit(color: Colors.white54, fontSize: 11)),
+                      Text(
+                        data.rainLikely ? "HIGH" : "LOW",
+                        style: GoogleFonts.outfit(
+                          fontWeight: FontWeight.bold,
+                          color: data.rainLikely ? _orange : _green,
+                        ),
                       ),
-                    )
-                  ],
+                    ],
+                  ),
                 ),
-              ),
+              ],
             ),
-          ],
-        )
+          ),
+        ),
       ],
     );
   }
 
-  void _showSettingsBottomSheet(BuildContext context, IrrigationProvider provider) {
+  // ── Crop Info ────────────────────────────────────────────────────────────────
+  Widget _buildCropInfo(IrrigationProvider provider) {
+    final settings = provider.settings;
+    final crop = settings?['cropType'] ?? "—";
+    final min  = settings?['minMoisture'];
+    final max  = settings?['maxMoisture'];
+    final range = (min != null && max != null) ? "$min% – $max%" : "—";
+
+    return GestureDetector(
+      onTap: () => _showSettingsSheet(context, provider),
+      child: GlassCard(
+        padding: const EdgeInsets.all(18),
+        child: Row(
+          children: [
+            Container(
+              width: 48,
+              height: 48,
+              decoration: BoxDecoration(
+                color: _green.withOpacity(0.1),
+                borderRadius: BorderRadius.circular(14),
+              ),
+              child: const Icon(Icons.eco_rounded, color: _green, size: 26),
+            ),
+            const SizedBox(width: 16),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text("Crop: $crop", style: GoogleFonts.outfit(fontWeight: FontWeight.bold, color: Colors.white)),
+                  Text("Moisture target: $range", style: GoogleFonts.outfit(color: Colors.white54, fontSize: 12)),
+                ],
+              ),
+            ),
+            const Icon(Icons.chevron_right_rounded, color: Colors.white38),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _showSettingsSheet(BuildContext context, IrrigationProvider provider) {
     showModalBottomSheet(
       context: context,
       backgroundColor: Colors.transparent,
       isScrollControlled: true,
-      builder: (context) => _CropSettingsSheet(provider: provider),
+      builder: (_) => _CropSettingsSheet(provider: provider),
     );
   }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Crop Settings Bottom Sheet (preserved from original, lightly updated)
 class _CropSettingsSheet extends StatefulWidget {
   final IrrigationProvider provider;
   const _CropSettingsSheet({required this.provider});
@@ -399,10 +751,10 @@ class _CropSettingsSheetState extends State<_CropSettingsSheet> {
   String? _selectedCrop;
   bool _isSaving = false;
 
-  final Map<String, String> _cropRanges = {
-    "Rice": "60% - 80%",
-    "Tomato": "40% - 60%",
-    "Cotton": "30% - 50%",
+  final Map<String, Map<String, String>> _crops = {
+    "Rice":   {"range": "60% – 80%", "icon": "🌾"},
+    "Tomato": {"range": "40% – 60%", "icon": "🍅"},
+    "Cotton": {"range": "30% – 50%", "icon": "🌿"},
   };
 
   @override
@@ -416,9 +768,9 @@ class _CropSettingsSheetState extends State<_CropSettingsSheet> {
     return Container(
       padding: const EdgeInsets.all(25),
       decoration: BoxDecoration(
-        color: const Color(0xFF0F2027).withOpacity(0.95),
+        color: _bgDark.withOpacity(0.96),
         borderRadius: const BorderRadius.vertical(top: Radius.circular(32)),
-        border: Border.all(color: Colors.white.withOpacity(0.1)),
+        border: Border.all(color: Colors.white.withOpacity(0.08)),
       ),
       child: Column(
         mainAxisSize: MainAxisSize.min,
@@ -426,93 +778,87 @@ class _CropSettingsSheetState extends State<_CropSettingsSheet> {
         children: [
           Center(
             child: Container(
-              width: 50,
-              height: 5,
+              width: 50, height: 5,
               decoration: BoxDecoration(color: Colors.white24, borderRadius: BorderRadius.circular(10)),
             ),
           ),
-          const SizedBox(height: 30),
-          Text("System Settings", style: GoogleFonts.outfit(fontSize: 24, fontWeight: FontWeight.bold, color: Colors.white)),
-          const SizedBox(height: 10),
-          Text("Configure your current field rotation.", style: GoogleFonts.outfit(color: Colors.white54)),
-          const SizedBox(height: 30),
-          
-          _buildInfoRow("Current Crop", _selectedCrop ?? "None"),
-          _buildInfoRow("Moisture Range", _cropRanges[_selectedCrop] ?? "--"),
-          const SizedBox(height: 30),
-          
-          Text("Select New Crop", style: GoogleFonts.outfit(fontWeight: FontWeight.bold, color: Colors.white)),
-          const SizedBox(height: 15),
+          const SizedBox(height: 28),
+          Text("System Settings", style: GoogleFonts.outfit(fontSize: 22, fontWeight: FontWeight.bold, color: Colors.white)),
+          const SizedBox(height: 6),
+          Text("Choose the active crop to set moisture targets.", style: GoogleFonts.outfit(color: Colors.white38, fontSize: 13)),
+          const SizedBox(height: 28),
+
+          _infoRow("Current Crop", _selectedCrop ?? "None"),
+          _infoRow("Moisture Range", _crops[_selectedCrop]?['range'] ?? "—"),
+          const SizedBox(height: 24),
+
+          Text("Select Crop", style: GoogleFonts.outfit(fontWeight: FontWeight.bold, color: Colors.white, fontSize: 15)),
+          const SizedBox(height: 14),
+
           Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: _cropRanges.keys.map((crop) => _buildCropOption(crop)).toList(),
+            mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+            children: _crops.keys.map(_buildCropOption).toList(),
           ),
-          
-          const SizedBox(height: 40),
+
+          const SizedBox(height: 36),
+
           GestureDetector(
-            onTap: _isSaving ? null : _saveSettings,
+            onTap: _isSaving || _selectedCrop == null ? null : _saveSettings,
             child: Container(
               width: double.infinity,
+              padding: const EdgeInsets.symmetric(vertical: 18),
               decoration: BoxDecoration(
                 borderRadius: BorderRadius.circular(20),
-                boxShadow: [
-                  BoxShadow(color: const Color(0xFF00E676).withOpacity(0.3), blurRadius: 20, spreadRadius: 2)
-                ]
+                gradient: const LinearGradient(colors: [Color(0xFF00B09B), Color(0xFF00E676)]),
+                boxShadow: [BoxShadow(color: _green.withOpacity(0.3), blurRadius: 20, spreadRadius: 2)],
               ),
-              child: GlassCard(
-                padding: const EdgeInsets.symmetric(vertical: 20),
-                child: Center(
-                  child: _isSaving 
-                    ? const SizedBox(height: 20, width: 20, child: CircularProgressIndicator(strokeWidth: 2, color: Color(0xFF00E676)))
-                    : Text(
-                        "SAVE CHANGES",
-                        style: GoogleFonts.outfit(color: const Color(0xFF00E676), fontWeight: FontWeight.bold, letterSpacing: 2),
-                      ),
-                ),
+              child: Center(
+                child: _isSaving
+                    ? const SizedBox(height: 20, width: 20, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+                    : Text("SAVE SETTINGS", style: GoogleFonts.outfit(color: Colors.white, fontWeight: FontWeight.bold, letterSpacing: 2, fontSize: 14)),
               ),
             ),
           ),
-          const SizedBox(height: 20),
+          const SizedBox(height: 24),
         ],
       ),
     );
   }
 
-  Widget _buildInfoRow(String label, String value) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 8.0),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-        children: [
-          Text(label, style: GoogleFonts.outfit(color: Colors.white70)),
-          Text(value, style: GoogleFonts.outfit(color: Colors.white, fontWeight: FontWeight.bold)),
-        ],
-      ),
-    );
-  }
+  Widget _infoRow(String label, String value) => Padding(
+    padding: const EdgeInsets.symmetric(vertical: 6),
+    child: Row(
+      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+      children: [
+        Text(label, style: GoogleFonts.outfit(color: Colors.white54)),
+        Text(value, style: GoogleFonts.outfit(color: Colors.white, fontWeight: FontWeight.bold)),
+      ],
+    ),
+  );
 
   Widget _buildCropOption(String crop) {
-    bool isSelected = _selectedCrop == crop;
+    final bool selected = _selectedCrop == crop;
     return GestureDetector(
       onTap: () => setState(() => _selectedCrop = crop),
-      child: GlassCard(
-        padding: const EdgeInsets.all(15),
-        borderRadius: 16,
-        opacity: isSelected ? 0.2 : 0.05,
-        borderOpacity: isSelected ? 0.6 : 0.1,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 200),
+        width: 95,
+        padding: const EdgeInsets.symmetric(vertical: 16, horizontal: 10),
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(18),
+          color: selected ? _green.withOpacity(0.15) : Colors.white.withOpacity(0.04),
+          border: Border.all(color: selected ? _green : Colors.white12, width: selected ? 1.5 : 1),
+        ),
         child: Column(
           children: [
-            Icon(
-              crop == "Rice" ? Icons.agriculture : (crop == "Tomato" ? Icons.restaurant : Icons.eco),
-              color: isSelected ? const Color(0xFF00E676) : Colors.white38,
-            ),
-            const SizedBox(height: 10),
+            Text(_crops[crop]!['icon']!, style: const TextStyle(fontSize: 28)),
+            const SizedBox(height: 8),
             Text(
               crop,
               style: GoogleFonts.outfit(
-                color: isSelected ? Colors.white : Colors.white38,
+                color: selected ? _green : Colors.white38,
                 fontSize: 12,
-                fontWeight: isSelected ? FontWeight.bold : FontWeight.normal
+                fontWeight: selected ? FontWeight.bold : FontWeight.normal,
               ),
             ),
           ],
@@ -522,11 +868,10 @@ class _CropSettingsSheetState extends State<_CropSettingsSheet> {
   }
 
   void _saveSettings() async {
+    if (_selectedCrop == null) return;
     setState(() => _isSaving = true);
     final success = await widget.provider.updateCrop(_selectedCrop!);
     setState(() => _isSaving = false);
-    if (success && mounted) {
-      Navigator.pop(context);
-    }
+    if (success && mounted) Navigator.pop(context);
   }
 }

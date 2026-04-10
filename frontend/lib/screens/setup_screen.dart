@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -22,6 +23,7 @@ class _SetupScreenState extends State<SetupScreen> {
   String _selectedCrop = "Rice";
   bool _isLocating = false;
   bool _isSaving = false;
+  String _savingStatus = "Initializing...";
 
   final List<Map<String, String>> _crops = [
     {"name": "Rice", "icon": "🌾"},
@@ -32,26 +34,79 @@ class _SetupScreenState extends State<SetupScreen> {
   Future<void> _fetchLocation() async {
     setState(() => _isLocating = true);
     try {
+      // 1. Check if location services are enabled on the device
+      bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
+      if (!serviceEnabled) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text(
+                  "Location services are disabled. Please enable GPS in device settings."),
+              duration: Duration(seconds: 4),
+            ),
+          );
+        }
+        setState(() => _isLocating = false);
+        return;
+      }
+
+      // 2. Check / request permission
       LocationPermission permission = await Geolocator.checkPermission();
+
       if (permission == LocationPermission.denied) {
         permission = await Geolocator.requestPermission();
+        if (permission == LocationPermission.denied) {
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(
+                content: Text("Location permission denied. Please allow access."),
+              ),
+            );
+          }
+          setState(() => _isLocating = false);
+          return;
+        }
       }
-      
-      if (permission == LocationPermission.whileInUse || permission == LocationPermission.always) {
+
+      if (permission == LocationPermission.deniedForever) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: const Text(
+                  "Location permission permanently denied. Opening app settings…"),
+              duration: const Duration(seconds: 3),
+              action: SnackBarAction(
+                label: "Settings",
+                onPressed: () => Geolocator.openAppSettings(),
+              ),
+            ),
+          );
+        }
+        setState(() => _isLocating = false);
+        return;
+      }
+
+      // 3. Permission granted — get position
+      if (permission == LocationPermission.whileInUse ||
+          permission == LocationPermission.always) {
         Position position = await Geolocator.getCurrentPosition(
-          desiredAccuracy: LocationAccuracy.high
+          desiredAccuracy: LocationAccuracy.high,
         );
-        setState(() {
-          _lat = position.latitude;
-          _lng = position.longitude;
-        });
+        if (mounted) {
+          setState(() {
+            _lat = position.latitude;
+            _lng = position.longitude;
+          });
+        }
       }
     } catch (e) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text("Error fetching location: $e")),
-      );
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text("Error fetching location: $e")),
+        );
+      }
     } finally {
-      setState(() => _isLocating = false);
+      if (mounted) setState(() => _isLocating = false);
     }
   }
 
@@ -63,9 +118,18 @@ class _SetupScreenState extends State<SetupScreen> {
       return;
     }
 
-    setState(() => _isSaving = true);
+    setState(() {
+      _isSaving = true;
+      _savingStatus = "Waking up server...";
+    });
 
     try {
+      // Step 1: Ping the server to wake it up (Render free tier cold start)
+      await _dataService.pingServer();
+
+      if (mounted) setState(() => _savingStatus = "Saving settings...");
+
+      // Step 2: Save settings
       bool success = await _dataService.updateSettings(
         latitude: _lat!,
         longitude: _lng!,
@@ -87,16 +151,41 @@ class _SetupScreenState extends State<SetupScreen> {
           );
         }
       } else {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text("Server error. Please try again."),
+              duration: Duration(seconds: 3),
+            ),
+          );
+        }
+      }
+    } on TimeoutException {
+      if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text("Server error. Please try again.")),
+          SnackBar(
+            content: const Text(
+              "Server is waking up (free tier). Please tap again in a moment ☀️"),
+            duration: const Duration(seconds: 5),
+            action: SnackBarAction(
+              label: "Retry",
+              onPressed: _saveAndProceed,
+            ),
+          ),
         );
       }
     } catch (e) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text("Error saving: $e")),
-      );
+      if (mounted) {
+        final msg = e.toString().contains('SocketException') ||
+                e.toString().contains('Connection refused')
+            ? "Cannot reach server. Check your internet connection."
+            : "Error: ${e.toString().replaceAll('Exception: ', '')}";
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(msg), duration: const Duration(seconds: 4)),
+        );
+      }
     } finally {
-      setState(() => _isSaving = false);
+      if (mounted) setState(() => _isSaving = false);
     }
   }
 
@@ -216,7 +305,24 @@ class _SetupScreenState extends State<SetupScreen> {
                     padding: const EdgeInsets.symmetric(vertical: 20),
                     child: Center(
                       child: _isSaving
-                        ? const CircularProgressIndicator()
+                        ? Column(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              const SizedBox(
+                                width: 24,
+                                height: 24,
+                                child: CircularProgressIndicator(strokeWidth: 2),
+                              ),
+                              const SizedBox(height: 8),
+                              Text(
+                                _savingStatus,
+                                style: GoogleFonts.outfit(
+                                  color: Colors.white60,
+                                  fontSize: 12,
+                                ),
+                              ),
+                            ],
+                          )
                         : Text(
                             "Initialize System",
                             style: GoogleFonts.outfit(
